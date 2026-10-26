@@ -979,6 +979,7 @@ export async function updatePatient(
     last_visit?: string | null;
     risk_level?: string;
     notes?: string | null;
+    locality?: string | null;
   },
 ) {
   const response = await fetch(`${API_URL}/api/patients/${patientId}`, {
@@ -1559,7 +1560,11 @@ export interface BloodNgoItem {
 export interface BloodCampaignAttempt {
   id: string;
   campaign_id: string;
-  donor_id: string;
+  donor_id?: string | null;
+  org_id?: string | null;
+  target_type?: "donor" | "org";
+  attempt_number?: number;
+  units_confirmed?: number | null;
   worker_pool_id?: string | null;
   worker_name?: string | null;
   status: string;
@@ -1585,9 +1590,30 @@ export interface BloodCampaignSummary {
   accepted: boolean;
 }
 
+export type BloodMessageKind =
+  | "donor_accepted"
+  | "org_accepted"
+  | "donor_missed"
+  | "contact_update"
+  | "contact_summary"
+  | "doctor_summary";
+
+/** An SMS or email sent alongside the calls for a blood request. */
+export interface BloodCampaignMessage {
+  id: string;
+  attempt_id: string | null;
+  kind: BloodMessageKind;
+  channel: "sms" | "email";
+  recipient: string;
+  status: "pending" | "sent" | "failed" | "skipped";
+  detail?: string | null;
+  created_at: string;
+}
+
 export interface BloodCampaignDetail {
   campaign: Record<string, unknown>;
   attempts: BloodCampaignAttempt[];
+  messages?: BloodCampaignMessage[];
   summary: BloodCampaignSummary;
 }
 
@@ -1687,6 +1713,8 @@ export async function getBloodCampaignStatus(campaignId: string) {
 
 export type BloodComponent = "whole_blood" | "packed_rbc" | "platelets" | "plasma";
 export type BloodUrgency = "emergency" | "urgent" | "planned";
+// Where blood may come from: individual donors, blood-storing organizations, or either.
+export type BloodSource = "donors" | "orgs" | "any";
 
 export interface BloodRequestInput {
   doctor_id: string;
@@ -1703,6 +1731,8 @@ export interface BloodRequestInput {
   hospital_location: string;
   contact_name: string;
   contact_phone: string;
+  source?: BloodSource;
+  radius_km?: number;
 }
 
 export interface BloodRequestItem {
@@ -1719,6 +1749,8 @@ export interface BloodRequestItem {
   patient_location?: string | null;
   contact_name?: string | null;
   contact_phone?: string | null;
+  source?: BloodSource;
+  radius_km?: number;
   status: string;
   created_at: string;
   completed_at?: string | null;
@@ -1870,4 +1902,97 @@ export function consultationSignalUrl(appointmentId: string, actorRole: "doctor"
   const base = API_URL.replace(/^http/, "ws");
   const qs = new URLSearchParams({ actor_role: actorRole, actor_id: actorId });
   return `${base}/api/consultations/${appointmentId}/signal?${qs.toString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Outbreak Watch
+// ---------------------------------------------------------------------------
+
+export type SyndromeKey = "dengue_like" | "respiratory" | "gastro" | "fever";
+export type OutbreakLevel = "alert" | "watch" | "normal";
+
+export interface OutbreakSignal {
+  locality: string;
+  syndrome: SyndromeKey;
+  syndrome_label: string;
+  level: OutbreakLevel;
+  observed: number;
+  previous_week: number;
+  expected: number;
+  ratio: number;
+  p_value: number;
+  chance: string;
+  daily: number[];
+}
+
+export interface OutbreakArea {
+  locality: string;
+  latitude: number | null;
+  longitude: number | null;
+  cases: number;
+  by_syndrome: Partial<Record<SyndromeKey, number>>;
+  level: OutbreakLevel;
+}
+
+export interface OutbreakSummary {
+  today: string;
+  window_days: number;
+  baseline_days: number;
+  days: string[];
+  syndromes: { key: SyndromeKey; label: string; watched: boolean }[];
+  trend: Record<SyndromeKey, number[]>;
+  signals: OutbreakSignal[];
+  areas: OutbreakArea[];
+  reports_in_window: number;
+  top_symptoms: { code: string; label: string; count: number }[];
+  platelets: {
+    dengue_cases_this_week: number;
+    dengue_cases_last_week: number;
+    growth: number;
+    projected_cases_next_week: number;
+    projected_units: number;
+    need_share: number;
+    units_per_episode: number;
+    eligible_donors: number;
+  };
+  calls_analysed_30d: number;
+  demo_reports: number;
+  call_reports: number;
+  demo_region: string | null;
+  brief: string;
+}
+
+async function outbreakRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_URL}/api/outbreak${path}`, init);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Outbreak Watch request failed (${response.status})`);
+  }
+  return response.json() as Promise<T>;
+}
+
+export function getOutbreakSummary(doctorId: string) {
+  return outbreakRequest<OutbreakSummary>(`/summary?doctor_id=${encodeURIComponent(doctorId)}`);
+}
+
+export function loadOutbreakDemoData(doctorId: string, city?: string) {
+  return outbreakRequest<{ inserted: number; region: string }>("/demo-data", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ doctor_id: doctorId, city: city || null }),
+  });
+}
+
+export function clearOutbreakDemoData(doctorId: string) {
+  return outbreakRequest<{ deleted: number }>(`/demo-data?doctor_id=${encodeURIComponent(doctorId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function emailOutbreakBrief(doctorId: string, toEmail: string) {
+  return outbreakRequest<{ sent: boolean; to_email: string }>("/brief/email", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ doctor_id: doctorId, to_email: toEmail }),
+  });
 }

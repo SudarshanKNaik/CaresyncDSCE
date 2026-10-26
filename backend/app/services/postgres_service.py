@@ -3206,7 +3206,7 @@ def upsert_blood_donors(
     return {"created": created, "updated": updated}
 
 
-def upsert_blood_ngos(
+def upsert_blood_orgs(
     doctor_id: str,
     ngos: list[dict[str, Any]],
 ) -> dict[str, int]:
@@ -3217,9 +3217,9 @@ def upsert_blood_ngos(
         for ngo in ngos:
             cur.execute(
                 """
-                INSERT INTO blood_ngos (
+                INSERT INTO blood_donor_org (
                     doctor_id,
-                    ngo_name,
+                    org_name,
                     phone_number,
                     location,
                     latitude,
@@ -3227,7 +3227,7 @@ def upsert_blood_ngos(
                     updated_at
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (doctor_id, phone_number, ngo_name)
+                ON CONFLICT (doctor_id, phone_number, org_name)
                 DO UPDATE SET
                     location = EXCLUDED.location,
                     latitude = EXCLUDED.latitude,
@@ -3267,16 +3267,14 @@ def list_blood_donors(doctor_id: str) -> list[dict[str, Any]]:
         return list(cur.fetchall())
 
 
-def list_blood_ngos(doctor_id: str) -> list[dict[str, Any]]:
+def list_blood_orgs(doctor_id: str) -> list[dict[str, Any]]:
     with _cursor() as cur:
         cur.execute(
             """
-            SELECT *
-            FROM blood_ngos
-            WHERE doctor_id = %s
+            SELECT *, org_name AS ngo_name
+            FROM blood_donor_org
             ORDER BY created_at DESC
             """,
-            (doctor_id,),
         )
         return list(cur.fetchall())
 
@@ -3316,12 +3314,25 @@ def list_call_worker_pools(
 
 
 def create_campaign_attempt(payload: dict[str, Any]) -> dict[str, Any]:
+    """Record one call attempt against a donor or an organization.
+
+    ``attempt_number`` counts earlier attempts on the same target in the
+    campaign, so an organization that hung up can be called a second time.
+    """
+    donor_id = payload.get("donor_id")
+    org_id = payload.get("org_id")
+    if bool(donor_id) == bool(org_id):
+        raise ValueError("An attempt needs exactly one of donor_id or org_id")
+
+    target_column = "donor_id" if donor_id else "org_id"
     with _cursor() as cur:
         cur.execute(
-            """
+            f"""
             INSERT INTO blood_campaign_donor_attempts (
                 campaign_id,
-                donor_id,
+                {target_column},
+                target_type,
+                attempt_number,
                 worker_pool_id,
                 status,
                 eligibility_reason,
@@ -3330,21 +3341,20 @@ def create_campaign_attempt(payload: dict[str, Any]) -> dict[str, Any]:
                 completed_at,
                 updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
-            ON CONFLICT (campaign_id, donor_id)
-            DO UPDATE SET
-                worker_pool_id = COALESCE(EXCLUDED.worker_pool_id, blood_campaign_donor_attempts.worker_pool_id),
-                status = EXCLUDED.status,
-                eligibility_reason = EXCLUDED.eligibility_reason,
-                message = EXCLUDED.message,
-                started_at = COALESCE(EXCLUDED.started_at, blood_campaign_donor_attempts.started_at),
-                completed_at = EXCLUDED.completed_at,
-                updated_at = now()
+            VALUES (
+                %s, %s, %s,
+                (SELECT COUNT(*) + 1 FROM blood_campaign_donor_attempts
+                  WHERE campaign_id = %s AND {target_column} = %s),
+                %s, %s, %s, %s, %s, %s, now()
+            )
             RETURNING *
             """,
             (
                 payload["campaign_id"],
-                payload["donor_id"],
+                donor_id or org_id,
+                "donor" if donor_id else "org",
+                payload["campaign_id"],
+                donor_id or org_id,
                 payload.get("worker_pool_id"),
                 payload.get("status", "queued"),
                 payload.get("eligibility_reason"),
@@ -3362,20 +3372,23 @@ def update_campaign_attempt(attempt_id: str, payload: dict[str, Any]) -> dict[st
 
 
 def list_campaign_attempts(campaign_id: str) -> list[dict[str, Any]]:
+    # donor_* columns hold the called party's details for both donors and
+    # organizations, so existing readers keep working.
     with _cursor() as cur:
         cur.execute(
             """
             SELECT
                 a.*,
-                d.name AS donor_name,
-                d.phone_number AS donor_phone_number,
+                COALESCE(d.name, o.org_name) AS donor_name,
+                COALESCE(d.phone_number, o.phone_number) AS donor_phone_number,
                 d.blood_type AS donor_blood_type,
-                d.location AS donor_location,
-                d.latitude AS donor_latitude,
-                d.longitude AS donor_longitude,
+                COALESCE(d.location, o.location) AS donor_location,
+                COALESCE(d.latitude, o.latitude) AS donor_latitude,
+                COALESCE(d.longitude, o.longitude) AS donor_longitude,
                 wp.worker_name
             FROM blood_campaign_donor_attempts a
-            JOIN blood_donors d ON d.id = a.donor_id
+            LEFT JOIN blood_donors d ON d.id = a.donor_id
+            LEFT JOIN blood_donor_org o ON o.id = a.org_id
             LEFT JOIN call_worker_pools wp ON wp.id = a.worker_pool_id
             WHERE a.campaign_id = %s
             ORDER BY a.created_at ASC
@@ -3420,41 +3433,83 @@ def compatible_donor_blood_types(recipient_blood_type: str, component: str) -> l
     return list(_RED_CELL_COMPATIBLE_DONORS.get(recipient, []))
 
 
-def list_campaign_eligible_donors(
+# Great-circle distance in km between (lat1, lng1) and (lat2, lng2) columns.
+_HAVERSINE_KM = """
+    2 * 6371 * asin(sqrt(
+        power(sin(radians(({lat2}) - ({lat1})) / 2), 2)
+        + cos(radians({lat1})) * cos(radians({lat2}))
+          * power(sin(radians(({lng2}) - ({lng1})) / 2), 2)
+    ))
+"""
+
+# An organization that hung up once gets one more call; a second hang-up (or
+# any other final answer) takes it out of this campaign.
+ORG_MAX_HANGUPS = 2
+
+
+def list_campaign_eligible_targets(
     campaign_id: str,
     *,
-    limit: int = 100,
-    offset: int = 0,
+    limit: int = 3,
 ) -> list[dict[str, Any]]:
+    """Next callable donors and/or organizations for a campaign.
+
+    Honors the campaign ``source`` (donors / orgs / any) and ``radius_km``
+    (when the hospital's coordinates are known). Organizations that hung up
+    once come first so they land in the next batch; everyone else is ranked
+    nearest first. Each row has ``target_type`` ('donor' or 'org') and the
+    target's id under ``id``.
+    """
     campaign = get_blood_campaign(campaign_id)
     if not campaign:
         return []
+    source = campaign.get("source") or "donors"
     allowed_types = compatible_donor_blood_types(
         campaign.get("blood_type") or "", campaign.get("component") or "whole_blood"
     )
-    if not allowed_types:
+    use_donors = source in ("donors", "any") and bool(allowed_types)
+    use_orgs = source in ("orgs", "any")
+    if not (use_donors or use_orgs):
         return []
 
-    with _cursor() as cur:
-        cur.execute(
-            """
-            SELECT d.*
+    donor_dist = _HAVERSINE_KM.format(
+        lat1="c.patient_latitude", lng1="c.patient_longitude",
+        lat2="d.latitude", lng2="d.longitude",
+    )
+    org_dist = _HAVERSINE_KM.format(
+        lat1="c.patient_latitude", lng1="c.patient_longitude",
+        lat2="o.latitude", lng2="o.longitude",
+    )
+
+    selects: list[str] = []
+    params: list[Any] = []
+
+    if use_donors:
+        selects.append(
+            f"""
+            SELECT 'donor'::text AS target_type, d.id, d.name,
+                   d.phone_number, d.blood_type, d.location, d.created_at,
+                   0 AS retry_rank,
+                   CASE WHEN d.latitude IS NULL OR d.longitude IS NULL
+                          OR c.patient_latitude IS NULL OR c.patient_longitude IS NULL
+                        THEN NULL ELSE {donor_dist} END AS distance_km
             FROM blood_donors d
             JOIN blood_campaigns c ON c.id = %s
-            LEFT JOIN blood_campaign_donor_attempts a
-                ON a.campaign_id = c.id AND a.donor_id = d.id
             WHERE d.doctor_id = c.doctor_id
               AND UPPER(d.blood_type) = ANY(%s::text[])
-              AND a.id IS NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM blood_campaign_donor_attempts a
+                    WHERE a.campaign_id = c.id AND a.donor_id = d.id
+              )
               -- Not while another request is calling them, and not if they've
               -- already agreed to donate for another request recently.
               AND NOT EXISTS (
-                    SELECT 1 FROM blood_campaign_donor_attempts o
-                    WHERE o.donor_id = d.id
-                      AND o.campaign_id <> c.id
+                    SELECT 1 FROM blood_campaign_donor_attempts o2
+                    WHERE o2.donor_id = d.id
+                      AND o2.campaign_id <> c.id
                       AND (
-                            o.status IN ('queued', 'active')
-                         OR (o.status = 'accepted' AND o.updated_at > now() - INTERVAL '90 days')
+                            o2.status IN ('queued', 'active')
+                         OR (o2.status = 'accepted' AND o2.updated_at > now() - INTERVAL '90 days')
                       )
               )
               AND (
@@ -3464,22 +3519,59 @@ def list_campaign_eligible_donors(
                         ELSE d.last_donated_date + INTERVAL '120 days'
                     END
                   ) <= CURRENT_DATE
-            -- Nearest donors first when both locations are known (a flat-earth
-            -- approximation is plenty for ranking within a city); others last.
-            ORDER BY
-                CASE
-                    WHEN d.latitude IS NULL OR d.longitude IS NULL
-                      OR c.patient_latitude IS NULL OR c.patient_longitude IS NULL
-                    THEN NULL
-                    ELSE power(d.latitude - c.patient_latitude, 2)
-                       + power((d.longitude - c.patient_longitude)
-                               * cos(radians(c.patient_latitude)), 2)
-                END ASC NULLS LAST,
-                d.created_at ASC
-            LIMIT %s OFFSET %s
-            """,
-            (campaign_id, allowed_types, limit, offset),
+            """
         )
+        params += [campaign_id, allowed_types]
+
+    if use_orgs:
+        selects.append(
+            f"""
+            SELECT 'org'::text AS target_type, o.id, o.org_name AS name,
+                   o.phone_number, NULL::text AS blood_type, o.location, o.created_at,
+                   (CASE WHEN EXISTS (
+                        SELECT 1 FROM blood_campaign_donor_attempts r
+                        WHERE r.campaign_id = c.id AND r.org_id = o.id AND r.status = 'hangup'
+                   ) THEN -1 ELSE 0 END) AS retry_rank,
+                   CASE WHEN o.latitude IS NULL OR o.longitude IS NULL
+                          OR c.patient_latitude IS NULL OR c.patient_longitude IS NULL
+                        THEN NULL ELSE {org_dist} END AS distance_km
+            FROM blood_donor_org o
+            JOIN blood_campaigns c ON c.id = %s
+            -- Organizations are a shared directory: any doctor's request may
+            -- call any of them (donors, by contrast, belong to one doctor).
+            WHERE TRUE
+              -- Never called yet, or hung up fewer than ORG_MAX_HANGUPS times
+              -- with no other final answer.
+              AND NOT EXISTS (
+                    SELECT 1 FROM blood_campaign_donor_attempts a
+                    WHERE a.campaign_id = c.id AND a.org_id = o.id
+                      AND a.status <> 'hangup'
+              )
+              AND (
+                    SELECT COUNT(*) FROM blood_campaign_donor_attempts a
+                    WHERE a.campaign_id = c.id AND a.org_id = o.id AND a.status = 'hangup'
+              ) < %s
+              AND NOT EXISTS (
+                    SELECT 1 FROM blood_campaign_donor_attempts a2
+                    WHERE a2.org_id = o.id AND a2.campaign_id <> c.id
+                      AND a2.status IN ('queued', 'active')
+              )
+            """
+        )
+        params += [campaign_id, ORG_MAX_HANGUPS]
+
+    union_sql = " UNION ALL ".join(f"({q})" for q in selects)
+    query = f"""
+        WITH c AS (SELECT radius_km FROM blood_campaigns WHERE id = %s),
+        candidates AS ({union_sql})
+        SELECT candidates.*
+        FROM candidates, c
+        WHERE candidates.distance_km IS NULL OR candidates.distance_km <= c.radius_km
+        ORDER BY retry_rank ASC, distance_km ASC NULLS LAST, created_at ASC
+        LIMIT %s
+    """
+    with _cursor() as cur:
+        cur.execute(query, [campaign_id, *params, limit])
         return list(cur.fetchall())
 
 
@@ -3503,3 +3595,127 @@ def list_blood_requests(doctor_id: str, limit: int = 50) -> list[dict[str, Any]]
             (doctor_id, limit),
         )
         return _json_safe(list(cur.fetchall()))
+
+
+# ---------------------------------------------------------------------------
+# Outbreak Watch: symptom reports from AI calls
+# ---------------------------------------------------------------------------
+
+_SYMPTOM_REPORT_COLUMNS = (
+    "doctor_id", "patient_id", "call_log_id", "source", "locality",
+    "latitude", "longitude", "symptoms", "syndrome", "reported_at", "region",
+)
+
+
+def upsert_call_symptom_report(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """One report per call; a second pass over the same call replaces the first."""
+    values = [payload.get(col) for col in _SYMPTOM_REPORT_COLUMNS]
+    with _cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO symptom_reports ({", ".join(_SYMPTOM_REPORT_COLUMNS)})
+            VALUES ({", ".join(["%s"] * len(_SYMPTOM_REPORT_COLUMNS))})
+            ON CONFLICT (call_log_id) WHERE call_log_id IS NOT NULL
+            DO UPDATE SET symptoms = EXCLUDED.symptoms,
+                          syndrome = EXCLUDED.syndrome,
+                          locality = EXCLUDED.locality,
+                          latitude = EXCLUDED.latitude,
+                          longitude = EXCLUDED.longitude
+            RETURNING *
+            """,
+            values,
+        )
+        return _json_safe(cur.fetchone())
+
+
+def insert_symptom_reports(rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    with _cursor() as cur:
+        cur.executemany(
+            f"""
+            INSERT INTO symptom_reports ({", ".join(_SYMPTOM_REPORT_COLUMNS)})
+            VALUES ({", ".join(["%s"] * len(_SYMPTOM_REPORT_COLUMNS))})
+            """,
+            [[row.get(col) for col in _SYMPTOM_REPORT_COLUMNS] for row in rows],
+        )
+    return len(rows)
+
+
+def delete_demo_symptom_reports(doctor_id: str) -> int:
+    with _cursor() as cur:
+        cur.execute(
+            "DELETE FROM symptom_reports WHERE doctor_id = %s AND source = 'demo'",
+            (doctor_id,),
+        )
+        return cur.rowcount
+
+
+def list_symptom_reports(doctor_id: str, since: datetime) -> list[dict[str, Any]]:
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT locality, latitude, longitude, symptoms, syndrome, source, region, reported_at
+            FROM symptom_reports
+            WHERE doctor_id = %s AND reported_at >= %s
+            ORDER BY reported_at
+            """,
+            (doctor_id, since),
+        )
+        return list(cur.fetchall())
+
+
+def count_completed_calls(doctor_id: str, since: datetime) -> int:
+    """Calls whose result has come back, i.e. the calls Outbreak Watch has read."""
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM call_logs cl
+            LEFT JOIN patients p ON p.id = cl.patient_id
+            WHERE COALESCE(cl.doctor_id, p.doctor_id) = %s
+              AND cl.status = 'completed'
+              AND cl.created_at >= %s
+            """,
+            (doctor_id, since),
+        )
+        return int(cur.fetchone()["n"])
+
+
+def count_eligible_donors(doctor_ids: list[str]) -> int:
+    """Donors past their donation cooldown (90 days men, 120 days women)."""
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM blood_donors d
+            WHERE d.doctor_id = ANY(%s)
+              AND d.last_donated_date + CASE
+                    WHEN LOWER(d.gender) IN ('female', 'f') THEN INTERVAL '120 days'
+                    ELSE INTERVAL '90 days'
+                  END <= CURRENT_DATE
+            """,
+            (doctor_ids,),
+        )
+        return int(cur.fetchone()["n"])
+
+
+def get_place_geocode(query: str) -> dict[str, Any] | None:
+    with _cursor() as cur:
+        cur.execute("SELECT * FROM place_geocodes WHERE query = %s", (query,))
+        return cur.fetchone()
+
+
+def save_place_geocode(payload: dict[str, Any]) -> None:
+    columns = ["query", "name", "latitude", "longitude", "south", "north", "west", "east", "areas"]
+    with _cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO place_geocodes ({", ".join(columns)})
+            VALUES ({", ".join(["%s"] * len(columns))})
+            ON CONFLICT (query) DO UPDATE SET
+                {", ".join(f"{c} = EXCLUDED.{c}" for c in columns[1:])},
+                created_at = now()
+            """,
+            [_to_db_value(payload.get(c)) for c in columns],
+        )
