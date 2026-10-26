@@ -13,7 +13,7 @@ from typing import Any
 from uuid import UUID
 
 import requests
-from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -90,6 +90,11 @@ def _follow_up_reason(
 ) -> str:
     if patient_confirmed and not confirmed_date:
         return "Patient confirmed but no appointment date captured"
+    if patient_confirmed and confirmed_date:
+        return (
+            f"Patient chose {confirmed_date} but it could not be booked "
+            "(taken by another caller or not on the schedule)"
+        )
     if not patient_confirmed:
         return f"No booking confirmation. call_outcome={call_outcome or 'unknown'}"
     return "Call completed without successful booking"
@@ -125,19 +130,33 @@ def _enqueue_follow_up_if_needed(
     if not call_log:
         return None
 
-    if not _is_follow_up_needed(
-        patient_confirmed=patient_confirmed,
-        confirmed_date=confirmed_date,
-        call_outcome=call_outcome,
-    ):
-        return None
-
     call_log_id = str(call_log.get("id") or "").strip()
     if not call_log_id:
         return None
 
     patient_id = str(call_log.get("patient_id") or "").strip()
-    doctor_id = str(call_log.get("doctor_id") or "").strip()
+    doctor_id = str(_resolve_doctor_id_for_call_log(call_log) or "").strip()
+
+    if not _is_follow_up_needed(
+        patient_confirmed=patient_confirmed,
+        confirmed_date=confirmed_date,
+        call_outcome=call_outcome,
+    ):
+        # The patient picked a time, but that only counts if it was booked:
+        # with simultaneous calls another caller can win the same slot, and the
+        # patient must not be left believing they have an appointment.
+        try:
+            booked = bool(
+                patient_id
+                and doctor_id
+                and db.has_active_appointment_for_patient_doctor(patient_id, doctor_id)
+            )
+        except Exception as exc:
+            logger.warning("Follow-up booking check failed: %s", exc)
+            booked = True  # can't tell; don't risk a duplicate call
+        if booked:
+            return None
+
     if patient_id and doctor_id:
         try:
             if db.has_active_appointment_for_patient_doctor(patient_id, doctor_id):
@@ -850,6 +869,22 @@ class AvailabilitySlotsCancelRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class AvailabilitySlotsReopenRequest(BaseModel):
+    slot_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class DoctorScheduleRequest(BaseModel):
+    """The doctor's editable schedule rules. Times are clinic-local HH:MM."""
+
+    day_start: str = Field(pattern=r"^\d{2}:\d{2}$")
+    day_end: str = Field(pattern=r"^\d{2}:\d{2}$")
+    break_start: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    break_end: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    slot_minutes: int = Field(ge=10, le=120)
+    working_days: list[int] = Field(min_length=1, max_length=7)  # ISO: 1 = Monday ... 7 = Sunday
+    window_days: int = Field(ge=1, le=90)
+
+
 class PatientPortalRegisterRequest(BaseModel):
     auth_user_id: str
     email: str
@@ -1170,9 +1205,43 @@ async def delete_doctor_slot(doctor_id: str, slot_id: str):
         ) from exc
 
 
+@router.get("/doctors/{doctor_id}/schedule")
+async def get_doctor_schedule(doctor_id: str):
+    doctor = _resolve_doctor_or_404(doctor_id)
+    schedule = await _run_db_call(db.get_doctor_schedule, str(doctor["id"]))
+    return {
+        **schedule.to_dict(),
+        "is_default": schedule == db.DEFAULT_SCHEDULE,
+        "timezone": settings.clinic_timezone,
+    }
+
+
+@router.put("/doctors/{doctor_id}/schedule")
+async def update_doctor_schedule(doctor_id: str, body: DoctorScheduleRequest):
+    """Save the doctor's hours, break, slot length, working days and booking
+    window, then rebuild their upcoming slots (booked appointments are kept)."""
+    doctor = _resolve_doctor_or_404(doctor_id)
+    if any(d < 1 or d > 7 for d in body.working_days):
+        raise HTTPException(status_code=422, detail="working_days must be 1 (Monday) to 7 (Sunday)")
+    try:
+        return await _run_db_call(db.save_doctor_schedule, str(doctor["id"]), body.model_dump())
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/doctors/{doctor_id}/slots/reopen")
+async def reopen_doctor_slots(doctor_id: str, body: AvailabilitySlotsReopenRequest):
+    """Make cancelled future slots bookable again."""
+    doctor = _resolve_doctor_or_404(doctor_id)
+    try:
+        return await _run_db_call(db.reopen_doctor_slots, doctor["id"], body.slot_ids)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/doctors/{doctor_id}/slots/cancel")
 async def cancel_doctor_slots(doctor_id: str, body: AvailabilitySlotsCancelRequest):
-    """Cancel several slots at once (the doctor's "Cancel day" action).
+    """Cancel one slot or several at once ("Remove" on a slot, or "Cancel day").
 
     Booked appointments on those slots are cancelled and the patients notified.
     """
@@ -1297,7 +1366,7 @@ async def update_appointment(appointment_id: str, body: AppointmentDoctorUpdateR
     try:
         if payload.get("status") == "cancelled":
             return db.cancel_appointment(
-                appointment_id, cancel_note="Cancelled by doctor"
+                appointment_id, cancel_note="Cancelled by doctor", cancelled_by="doctor"
             )
         return db.update_appointment(appointment_id, payload)
     except RuntimeError as exc:
@@ -1333,6 +1402,103 @@ async def get_or_create_consultation_room(
             room_name=f"consult-{appointment_id[:8]}",
         )
     return room
+
+
+# ---------------------------------------------------------------------------
+# Video consultation: our own 1:1 WebRTC call (replaces the meet.jit.si embed,
+# which forces the first person to sign in and cuts embedded calls short).
+# The server only relays connection messages between the doctor's and the
+# patient's browsers; audio and video flow directly between them.
+# ---------------------------------------------------------------------------
+
+# appointment_id -> {"doctor": WebSocket, "patient": WebSocket}
+_video_rooms: dict[str, dict[str, WebSocket]] = {}
+_video_rooms_lock = asyncio.Lock()
+# Only these message types are relayed, so the channel can't be used for anything else.
+_RELAYED_SIGNALS = {"offer", "answer", "ice", "hangup", "media-state"}
+
+
+@router.get("/consultations/ice-servers")
+async def consultation_ice_servers():
+    """STUN (and optional TURN) servers the browsers use to connect."""
+    servers: list[dict[str, Any]] = [
+        {"urls": [u.strip() for u in settings.webrtc_stun_urls.split(",") if u.strip()]}
+    ]
+    if settings.webrtc_turn_url.strip():
+        servers.append(
+            {
+                "urls": [u.strip() for u in settings.webrtc_turn_url.split(",") if u.strip()],
+                "username": settings.webrtc_turn_username,
+                "credential": settings.webrtc_turn_credential,
+            }
+        )
+    return {"ice_servers": servers}
+
+
+@router.websocket("/consultations/{appointment_id}/signal")
+async def consultation_signal(websocket: WebSocket, appointment_id: str, actor_role: str, actor_id: str):
+    appointment = await run_in_threadpool(db.get_appointment, appointment_id)
+    try:
+        if not appointment:
+            raise HTTPException(status_code=404, detail="Appointment not found")
+        role, _ = await run_in_threadpool(_validate_consultation_access, appointment, actor_role, actor_id)
+    except HTTPException as exc:
+        await websocket.close(code=4403, reason=str(exc.detail)[:120])
+        return
+
+    await websocket.accept()
+    other_role = "patient" if role == "doctor" else "doctor"
+
+    async with _video_rooms_lock:
+        room = _video_rooms.setdefault(appointment_id, {})
+        previous = room.get(role)
+        room[role] = websocket
+        other = room.get(other_role)
+    if previous is not None:
+        # Same person rejoined (refresh / second tab): the newest tab wins.
+        try:
+            await previous.send_json({"type": "replaced"})
+            await previous.close(code=4000)
+        except Exception:
+            pass
+
+    await websocket.send_json({"type": "joined", "role": role, "peer_present": other is not None})
+    if other is not None:
+        try:
+            # The one already waiting starts the connection (sends the offer).
+            await other.send_json({"type": "peer-joined", "role": role})
+        except Exception:
+            pass
+
+    try:
+        while True:
+            message = await websocket.receive_json()
+            if not isinstance(message, dict) or message.get("type") not in _RELAYED_SIGNALS:
+                continue
+            async with _video_rooms_lock:
+                target = _video_rooms.get(appointment_id, {}).get(other_role)
+            if target is not None:
+                try:
+                    await target.send_json({**message, "from": role})
+                except Exception:
+                    pass
+    except (WebSocketDisconnect, RuntimeError, ValueError):
+        pass
+    finally:
+        async with _video_rooms_lock:
+            room = _video_rooms.get(appointment_id, {})
+            if room.get(role) is websocket:
+                room.pop(role, None)
+                other = room.get(other_role)
+                if not room:
+                    _video_rooms.pop(appointment_id, None)
+            else:
+                other = None  # replaced by a newer tab; nothing changed for the peer
+        if other is not None:
+            try:
+                await other.send_json({"type": "peer-left", "role": role})
+            except Exception:
+                pass
 
 
 @router.get(
@@ -2035,15 +2201,16 @@ def _resolve_time(raw: str) -> str:
             hour += 12
         return f"{hour:02d}:{minute}"
 
-    # 12-hour format: "2:15 PM", "2:15pm", "10:30 AM"
-    match = re.match(r"(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)", raw)
+    # 12-hour format: "2:15 PM", "2:15pm", "10:30 AM", "11 AM", "3pm", "11.30 a.m."
+    # (Without the minutes-optional form, "11 AM" fell through to the 09:00 default.)
+    match = re.match(r"^(\d{1,2})(?:[:.](\d{2}))?\s*([ap])\.?\s*m\.?$", raw, re.IGNORECASE)
     if match:
         hour = int(match.group(1))
-        minute = match.group(2)
+        minute = match.group(2) or "00"
         ampm = match.group(3).lower()
-        if ampm == "pm" and hour != 12:
+        if ampm == "p" and hour != 12:
             hour += 12
-        elif ampm == "am" and hour == 12:
+        elif ampm == "a" and hour == 12:
             hour = 0
         return f"{hour:02d}:{minute}"
 
@@ -2074,6 +2241,29 @@ def _extract_call_refs_from_execution_log(
             call_sid = str(raw_sid).strip()
 
     return conversation_id, call_sid
+
+
+# Languages the agents are set up for (ElevenLabs language codes).
+SUPPORTED_CALL_LANGUAGES = {"en", "kn", "hi", "or", "ta", "te", "ml", "mr", "bn", "gu", "pa", "as", "sd"}
+# The agent may record the language name instead of its code.
+_LANGUAGE_NAMES = {
+    "english": "en", "kannada": "kn", "hindi": "hi", "odia": "or", "oriya": "or",
+    "tamil": "ta", "telugu": "te", "malayalam": "ml", "marathi": "mr", "bengali": "bn",
+    "bangla": "bn", "gujarati": "gu", "punjabi": "pa", "assamese": "as", "sindhi": "sd",
+}
+
+
+def _remember_patient_language(call_log: dict[str, Any] | None, language: str) -> None:
+    """Save the language a call was held in, so the next call starts in it."""
+    raw = (language or "").strip().lower()
+    code = _LANGUAGE_NAMES.get(raw, raw[:5])
+    patient_id = (call_log or {}).get("patient_id")
+    if not patient_id or code not in SUPPORTED_CALL_LANGUAGES:
+        return
+    try:
+        db.update_patient(str(patient_id), {"preferred_language": code})
+    except Exception as exc:
+        logger.warning("Could not save preferred language for patient %s: %s", patient_id, exc)
 
 
 def _normalize_dcr_value(entry: Any) -> str:
@@ -2383,7 +2573,7 @@ def get_follow_up_scheduler_state() -> dict[str, Any]:
 
 
 async def _auto_poll_call_result(
-    log_id: str, max_attempts: int = 40, interval: int = 30
+    log_id: str, max_attempts: int = 300, interval: int = 4
 ):
     """
     Background task that polls ElevenLabs every *interval* seconds until the
@@ -2391,6 +2581,11 @@ async def _auto_poll_call_result(
     an appointment row if the patient confirmed).
 
     This replaces the need to manually call POST /api/call-logs/{id}/check.
+
+    It is the fallback when the post-call webhook can't reach this server
+    (e.g. APP_BASE_URL is localhost), so it polls often: a 30 s interval used
+    to add up to half a minute before a booking appeared. 300 x 4 s keeps the
+    same ~20-minute limit.
     """
     from app.services.elevenlabs_service import (
         get_conversation,
@@ -2404,8 +2599,9 @@ async def _auto_poll_call_result(
         interval,
     )
 
-    # Wait a bit before the first poll — the call takes time to connect
-    await asyncio.sleep(15)
+    # Short wait before the first poll (gives ElevenLabs time to assign the
+    # conversation id); short calls can end within seconds.
+    await asyncio.sleep(5)
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -2533,6 +2729,7 @@ async def _auto_poll_call_result(
             confirmed_time = _dcr_val("confirmed_time")
             doctor_name = _dcr_val("doctor_name")
             availability_notes = _dcr_val("patient_availability_notes")
+            _remember_patient_language(call_log, _dcr_val("preferred_language"))
 
             # Transcript may be a string or a list of message dicts
             raw_transcript = conversation.get("transcript", "")
@@ -3002,6 +3199,150 @@ async def lab_event(body: LabEventRequest):
 
 
 # ---------------------------------------------------------------------------
+# ElevenLabs live tools (called by the agent DURING a call)
+# ---------------------------------------------------------------------------
+# Configure these as two webhook "server tools" on the agent, both sending
+# header X-Tool-Secret: <ELEVENLABS_TOOL_SECRET> and {{call_log_id}} in the body.
+# They answer from the live database, so the agent never offers a time another
+# caller has just taken, and a held time can't be booked by a parallel call.
+
+
+class AgentAvailableTimesRequest(BaseModel):
+    call_log_id: str
+    date: str = Field(min_length=1, max_length=40)
+
+
+class AgentHoldSlotRequest(BaseModel):
+    call_log_id: str
+    date: str = Field(min_length=1, max_length=40)
+    time: str = Field(min_length=1, max_length=20)
+
+
+def _check_agent_tool_secret(request: Request) -> None:
+    expected = settings.elevenlabs_tool_secret.strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="ELEVENLABS_TOOL_SECRET is not configured; agent tools are disabled",
+        )
+    provided = request.headers.get("x-tool-secret", "")
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid tool secret")
+
+
+def _call_context_for_tool(call_log_id: str) -> tuple[str, str]:
+    call_log = db.get_call_log(call_log_id)
+    if not call_log:
+        raise HTTPException(status_code=404, detail="Unknown call_log_id")
+    doctor_id = _resolve_doctor_id_for_call_log(call_log)
+    patient_id = call_log.get("patient_id")
+    if not doctor_id or not patient_id:
+        raise HTTPException(status_code=404, detail="Call has no doctor or patient")
+    return str(doctor_id), str(patient_id)
+
+
+def _parse_tool_date(raw: str):
+    from datetime import date as date_cls
+
+    resolved = _resolve_date(raw)
+    try:
+        return date_cls.fromisoformat(resolved) if resolved else None
+    except ValueError:
+        return None
+
+
+def _spoken_times(slots: list[dict[str, Any]]) -> list[str]:
+    out = []
+    for slot in slots:
+        start = db._parse_iso_datetime(slot.get("slot_start"))
+        if start:
+            local = start.astimezone(db.CLINIC_TZ)
+            out.append(f"{local.hour % 12 or 12}:{local.strftime('%M %p')}")
+    return out
+
+
+@router.post("/elevenlabs/tools/available-times")
+async def agent_tool_available_times(body: AgentAvailableTimesRequest, request: Request):
+    """Agent asks: which times are free on the date the patient chose?"""
+    _check_agent_tool_secret(request)
+    doctor_id, _ = await run_in_threadpool(_call_context_for_tool, body.call_log_id)
+
+    day = _parse_tool_date(body.date)
+    if not day:
+        return {"available": False, "message": f"I couldn't understand the date '{body.date}'. Please ask the patient for the day again."}
+
+    slots = await _run_db_call(db.get_available_slots_on_date, doctor_id, day)
+    times = _spoken_times(slots)
+    spoken_date = db._speech_date(day)
+    if times:
+        return {
+            "available": True,
+            "date": day.isoformat(),
+            "spoken_date": spoken_date,
+            "times": times,
+            "message": f"On {spoken_date} the open times are: {', '.join(times)}.",
+        }
+
+    upcoming = await _run_db_call(db.get_available_slot_options, doctor_id, 60)
+    return {
+        "available": False,
+        "date": day.isoformat(),
+        "spoken_date": spoken_date,
+        "times": [],
+        "message": (
+            f"There are no open times on {spoken_date}. "
+            f"Days with openings: {db.format_available_dates_for_speech(upcoming)}."
+        ),
+    }
+
+
+@router.post("/elevenlabs/tools/hold-slot")
+async def agent_tool_hold_slot(body: AgentHoldSlotRequest, request: Request):
+    """Agent says: the patient picked this date and time, hold it for them.
+
+    The hold lasts 30 minutes; the post-call booking turns it into an
+    appointment. Call this before telling the patient the time is booked.
+    """
+    _check_agent_tool_secret(request)
+    doctor_id, patient_id = await run_in_threadpool(_call_context_for_tool, body.call_log_id)
+
+    day = _parse_tool_date(body.date)
+    if not day:
+        return {"held": False, "message": f"I couldn't understand the date '{body.date}'. Please confirm the day with the patient."}
+    try:
+        hh, mm = _resolve_time(body.time).split(":")
+        from datetime import time as time_cls
+
+        local_time = time_cls(int(hh), int(mm))
+    except (ValueError, TypeError):
+        return {"held": False, "message": f"I couldn't understand the time '{body.time}'. Please confirm the time with the patient."}
+
+    result = await _run_db_call(db.hold_slot_for_call, doctor_id, patient_id, day, local_time)
+    spoken = f"{db._speech_date(day)} at {local_time.hour % 12 or 12}:{local_time.strftime('%M')} {'AM' if local_time.hour < 12 else 'PM'}"
+    if result["held"]:
+        return {
+            "held": True,
+            "confirmed_date": day.isoformat(),
+            "confirmed_time": local_time.strftime("%H:%M"),
+            "message": f"{spoken} is now held for the patient. Confirm it with them.",
+        }
+
+    alternatives = _spoken_times(result.get("alternatives") or [])
+    why = (
+        "was just taken by another patient"
+        if result.get("reason") == "taken"
+        else "isn't one of the doctor's appointment times"
+    )
+    return {
+        "held": False,
+        "message": (
+            f"{spoken} {why}. "
+            + (f"Still open that day: {', '.join(alternatives)}." if alternatives else "Nothing else is open that day; offer another day.")
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # ElevenLabs post-call webhook
 # ---------------------------------------------------------------------------
 
@@ -3115,9 +3456,10 @@ async def elevenlabs_webhook(request: Request):
         }
 
     # ---- extract data collection results ----
-    data_section = payload.get("data", {})
-    analysis = data_section.get("analysis", {})
-    dcr = analysis.get("data_collection_results", {})
+    data_section = payload.get("data") or {}
+    # ElevenLabs sends "analysis": null until analysis is ready.
+    analysis = data_section.get("analysis") or {}
+    dcr = analysis.get("data_collection_results") or {}
 
     def _dcr_val(key: str) -> str:
         return _normalize_dcr_value(dcr.get(key, {}))
@@ -3160,6 +3502,7 @@ async def elevenlabs_webhook(request: Request):
         return {"success": False, "error": "no matching call_log"}
 
     log_id = call_log["id"]
+    _remember_patient_language(call_log, _dcr_val("preferred_language"))
     logger.info(
         "[11L][webhook][matched_call_log] call_log_id=%s workflow_id=%s patient_id=%s",
         log_id,
@@ -3790,8 +4133,9 @@ async def check_call_status(log_id: str):
         }
 
     # Conversation is done — extract data collection results
-    analysis = conversation.get("analysis", {})
-    dcr = analysis.get("data_collection_results", {})
+    # ElevenLabs returns "analysis": null until analysis is ready.
+    analysis = conversation.get("analysis") or {}
+    dcr = analysis.get("data_collection_results") or {}
 
     def _dcr_val(key: str) -> str:
         return _normalize_dcr_value(dcr.get(key, {}))
@@ -3802,6 +4146,7 @@ async def check_call_status(log_id: str):
     confirmed_time = _dcr_val("confirmed_time")
     doctor_name = _dcr_val("doctor_name")
     availability_notes = _dcr_val("patient_availability_notes")
+    _remember_patient_language(call_log, _dcr_val("preferred_language"))
     transcript = conversation.get("transcript", "")
 
     patient_confirmed = patient_confirmed_raw.lower() in ("true", "yes", "1")
@@ -4607,6 +4952,92 @@ async def doctor_upcoming_appointments_with_report(doctor_id: str):
         db.list_doctor_upcoming_appointments_with_report, doctor["id"]
     )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Google Calendar (per-doctor OAuth)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/doctors/{doctor_id}/google-calendar")
+async def google_calendar_status(doctor_id: str):
+    from app.services import google_calendar_service as gcal
+
+    doctor = await _resolve_doctor_or_404_async(doctor_id)
+    return await run_in_threadpool(gcal.get_connection_status, str(doctor["id"]))
+
+
+@router.post("/doctors/{doctor_id}/google-calendar/connect")
+async def google_calendar_connect(doctor_id: str):
+    """Returns the Google consent URL; the browser goes there to connect."""
+    from app.services import google_calendar_service as gcal
+
+    doctor = await _resolve_doctor_or_404_async(doctor_id)
+    try:
+        return {"auth_url": gcal.build_authorization_url(str(doctor["id"]))}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/google/oauth/callback")
+async def google_oauth_callback(
+    code: str | None = None, state: str | None = None, error: str | None = None
+):
+    """Google redirects here after consent; we store the tokens and send the
+    doctor back to Settings with the result."""
+    from urllib.parse import urlencode
+
+    from fastapi.responses import RedirectResponse
+
+    from app.services import google_calendar_service as gcal
+
+    def back(status: str, message: str | None = None) -> RedirectResponse:
+        query = {"google": status, **({"message": message} if message else {})}
+        return RedirectResponse(
+            f"{settings.frontend_base_url.rstrip('/')}/settings?{urlencode(query)}", status_code=302
+        )
+
+    if error:
+        return back("error", "Google sign-in was cancelled" if error == "access_denied" else error)
+    if not code or not state:
+        return back("error", "Missing code from Google")
+
+    try:
+        doctor_id = gcal.verify_state(state)
+        await run_in_threadpool(gcal.complete_oauth, doctor_id, code)
+    except Exception as exc:
+        logger.exception("Google Calendar connect failed")
+        return back("error", str(exc)[:200])
+
+    # Put already-booked upcoming appointments on the newly connected calendar.
+    try:
+        upcoming = await _run_db_call(db.list_doctor_upcoming_appointments_with_report, doctor_id)
+        gcal.queue_appointment_sync(
+            *(a["id"] for a in upcoming if a.get("status") in {"booked", "confirmed"})
+        )
+    except Exception as exc:
+        logger.warning("Initial Google Calendar sync failed: %s", exc)
+
+    return back("connected")
+
+
+@router.delete("/doctors/{doctor_id}/google-calendar", status_code=204)
+async def google_calendar_disconnect(doctor_id: str):
+    from app.services import google_calendar_service as gcal
+
+    doctor = await _resolve_doctor_or_404_async(doctor_id)
+    await run_in_threadpool(gcal.disconnect, str(doctor["id"]))
+
+
+@router.get("/doctors/{doctor_id}/appointment-activity")
+async def doctor_appointment_activity(doctor_id: str, days: int = 14):
+    """Recent bookings, cancellations and reschedules, for the dashboard and bell."""
+    doctor = await _run_db_call(db.resolve_doctor, doctor_id)
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    return await _run_db_call(
+        db.list_doctor_appointment_activity, str(doctor["id"]), max(1, min(days, 90))
+    )
 
 
 @router.get("/patient-portal/upcoming-appointments")

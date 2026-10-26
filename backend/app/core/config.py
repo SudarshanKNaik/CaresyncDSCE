@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     elevenlabs_phone_number_id: str = ""
     elevenlabs_webhook_secret: str = ""  # wsec_... from ElevenLabs dashboard
     elevenlabs_blood_agent_id: str = ""  # optional; blood campaigns fall back to elevenlabs_agent_id
+    # Shared secret ElevenLabs sends (X-Tool-Secret header) when the agent calls
+    # our live slot tools mid-call. The tool endpoints refuse requests without it.
+    elevenlabs_tool_secret: str = ""
 
     # SMTP email delivery (OTP + notifications)
     smtp_host: str = "smtp.gmail.com"
@@ -38,6 +41,23 @@ class Settings(BaseSettings):
 
     # Google Calendar direct API token
     google_calendar_access_token: str = ""
+
+    # Google Calendar via OAuth: each doctor connects their own calendar.
+    # Create a "Web application" OAuth client in Google Cloud and register
+    # google_oauth_redirect_uri as an authorized redirect URI.
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+    google_oauth_redirect_uri: str = "http://localhost:8000/api/google/oauth/callback"
+    # Where the browser lands after connecting (the doctor's Settings page).
+    frontend_base_url: str = "http://localhost:3000"
+
+    # Video consultations (browser-to-browser WebRTC). STUN finds a direct
+    # route; a TURN relay is only needed on networks that block direct
+    # connections. Leave TURN empty to use STUN only.
+    webrtc_stun_urls: str = "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302"
+    webrtc_turn_url: str = ""
+    webrtc_turn_username: str = ""
+    webrtc_turn_credential: str = ""
 
     # Gemini extraction (Vision + text fallback)
     google_gemini_api_key: str = ""
@@ -62,6 +82,11 @@ class Settings(BaseSettings):
     follow_up_cron_poll_interval_seconds: int = 15
     follow_up_cron_max_attempts: int = 3
     follow_up_cron_batch_size: int = 10
+
+    # Patient SMS (Twilio) + email notifications for bookings, reschedules
+    # and cancellations. Each channel also needs its credentials above.
+    notify_patients_sms: bool = True
+    notify_patients_email: bool = True
 
     # NGO portal
     ngo_session_ttl_hours: int = 12

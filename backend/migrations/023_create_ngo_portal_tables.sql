@@ -1,5 +1,5 @@
 -- ============================================================
--- Migration 020: NGO Portal
+-- Migration 023: NGO Portal
 -- ============================================================
 -- Additive only. Existing patients, user_accounts rows and
 -- doctor/patient behaviour are untouched:

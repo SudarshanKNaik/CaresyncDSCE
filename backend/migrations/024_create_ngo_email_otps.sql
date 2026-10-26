@@ -1,5 +1,5 @@
 -- ============================================================
--- Migration 021: NGO self-registration email OTPs
+-- Migration 024: NGO self-registration email OTPs
 -- ============================================================
 -- Kept separate from doctor/patient email_otp_codes so NGO sign-up
 -- never touches the doctor/patient auth flow. Only a SHA-256 hash of

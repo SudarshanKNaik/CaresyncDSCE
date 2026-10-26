@@ -20,7 +20,6 @@ export default function TriggerNode({ data, selected }: NodeProps) {
     >
       {/* Header */}
       <div className="flex items-center gap-2 mb-2">
-        <span className="text-blue-600 text-base leading-none">⚡</span>
         <span className="text-[10px] text-blue-600 uppercase tracking-widest font-bold">Trigger</span>
       </div>
 

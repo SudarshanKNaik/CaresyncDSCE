@@ -54,6 +54,7 @@ _DOB_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y")
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 _PBKDF2_ITERATIONS = 600_000
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+_DARPAN_ID_RE = re.compile(r"[0-9]{5}")
 _OTP_TTL_MINUTES = 10
 _OTP_RESEND_SECONDS = 60
 _OTP_MAX_ATTEMPTS = 5
@@ -384,11 +385,26 @@ def _consume_registration_otp(cur, email: str, code: str) -> bool:
     return True
 
 
+def _ensure_ngo_unique(cur, name: str, darpan_id: str) -> None:
+    cur.execute("SELECT 1 FROM ngo_organizations WHERE lower(name) = lower(%s)", (name,))
+    if cur.fetchone():
+        raise NgoError(
+            409, "ngo_exists", "An NGO with this name is already registered",
+            field_errors={"ngo_name": "Already registered"},
+        )
+    cur.execute("SELECT 1 FROM ngo_organizations WHERE darpan_id = %s", (darpan_id,))
+    if cur.fetchone():
+        raise NgoError(
+            409, "darpan_id_exists", "An NGO with this Darpan ID is already registered",
+            field_errors={"darpan_id": "Already registered"},
+        )
+
+
 def register_ngo(
     *,
     ngo_name: str,
     city: str | None,
-    registration_number: str | None,
+    darpan_id: str,
     contact_phone: str | None,
     admin_name: str,
     email: str,
@@ -403,6 +419,9 @@ def register_ngo(
         field_errors["ngo_name"] = "NGO name must be at least 3 characters"
     if len(admin_name.strip()) < 2:
         field_errors["admin_name"] = "Your name must be at least 2 characters"
+    darpan_id = (darpan_id or "").strip()
+    if not _DARPAN_ID_RE.fullmatch(darpan_id):
+        field_errors["darpan_id"] = "Darpan ID must be exactly 5 digits"
     try:
         normalized_email = _validate_new_account(email, password, "admin")
     except RuntimeError as exc:
@@ -417,6 +436,10 @@ def register_ngo(
     if field_errors:
         raise NgoError(422, "validation_error", "Please correct the highlighted fields", field_errors=field_errors)
 
+    # Reject already-registered NGOs before spending the OTP (re-checked below).
+    with db._cursor() as cur:
+        _ensure_ngo_unique(cur, clean_name, darpan_id)
+
     # The OTP is consumed in its own transaction so failed attempts are counted
     # even when the rest of the registration is rejected.
     with _transaction() as (_conn, cur):
@@ -429,17 +452,12 @@ def register_ngo(
 
     try:
         with _transaction() as (_conn, cur):
-            cur.execute("SELECT 1 FROM ngo_organizations WHERE lower(name) = lower(%s)", (clean_name,))
-            if cur.fetchone():
-                raise NgoError(
-                    409, "ngo_exists", "An NGO with this name is already registered",
-                    field_errors={"ngo_name": "Already registered"},
-                )
+            _ensure_ngo_unique(cur, clean_name, darpan_id)
             org = db._insert_row(
                 "ngo_organizations",
                 {
                     "name": clean_name,
-                    "registration_number": (registration_number or "").strip() or None,
+                    "darpan_id": darpan_id,
                     "contact_email": normalized_email,
                     "contact_phone": (contact_phone or "").strip() or None,
                     "city": (city or "").strip() or None,

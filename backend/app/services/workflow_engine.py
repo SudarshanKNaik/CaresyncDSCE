@@ -10,6 +10,7 @@ Returns a list of step-log dicts that gets stored in call_logs.execution_log.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, timezone
 from typing import Any
@@ -466,6 +467,7 @@ async def _handle_call_patient(node: dict, context: dict) -> tuple[bool, dict]:
         or "follow-up on your recent report"
     )
     available_slots_str = params.get("available_slots", "")
+    available_dates_str = ""
 
     # ── Build slot options from DB when not provided in node params ───────────
     doctor_id = context.get("doctor_id")
@@ -475,15 +477,22 @@ async def _handle_call_patient(node: dict, context: dict) -> tuple[bool, dict]:
         try:
             # Give the agent the full upcoming list (not just 3) so it can answer
             # "what else do you have?" without making times up.
-            slot_options_raw = db_svc.get_available_slot_options(doctor_id)
+            # Dates come from the whole open window; the full time list (a
+            # fallback for agents without the live tools) is capped at 12.
+            window_slots = db_svc.get_available_slot_options(doctor_id, count=60)
+            slot_options_raw = window_slots[:12]
             available_slots_str = db_svc.format_slot_options_for_speech(
                 slot_options_raw
+            )
+            available_dates_str = db_svc.format_available_dates_for_speech(
+                window_slots
             )
         except Exception as exc:
             logger.warning(
                 "Could not fetch slot options for doctor %s: %s", doctor_id, exc
             )
             available_slots_str = db_svc.NO_SLOTS_AVAILABLE_TEXT
+            available_dates_str = db_svc.NO_SLOTS_AVAILABLE_TEXT
 
     # ── Persist slot_options in call_log for later reference ─────────────────
     if call_log_id and slot_options_raw:
@@ -510,7 +519,11 @@ async def _handle_call_patient(node: dict, context: dict) -> tuple[bool, dict]:
                 "call_log_id": call_log_id or "",
                 "workflow_id": context.get("workflow_id", ""),
                 "report_id": report_id or "",
+                # Offer these days first; read times only for the chosen day.
+                "available_dates": available_dates_str or available_slots_str,
             },
+            # Remembered from an earlier call: start in it instead of asking.
+            language=patient.get("preferred_language"),
         )
         conversation_id = result.get("conversation_id") or ""
         call_sid = result.get("callSid") or result.get("call_sid") or ""
@@ -629,7 +642,9 @@ async def _handle_send_sms(node: dict, context: dict) -> tuple[bool, dict]:
     if not phone:
         return False, _step_log(node, "error", "No patient phone number available")
 
-    if not (settings.twilio_account_sid and settings.twilio_auth_token and settings.twilio_phone_number):
+    from app.services.sms_service import send_sms_sync, sms_configured
+
+    if not sms_configured():
         return False, _step_log(
             node,
             "error",
@@ -638,14 +653,10 @@ async def _handle_send_sms(node: dict, context: dict) -> tuple[bool, dict]:
         )
 
     try:
-        from twilio.rest import Client as TwilioClient
-
-        twilio = TwilioClient(settings.twilio_account_sid, settings.twilio_auth_token)
-        msg = twilio.messages.create(
-            to=phone, from_=settings.twilio_phone_number, body=body
-        )
+        # Patients' phones are stored without +91; Twilio needs E.164.
+        sid = await asyncio.to_thread(send_sms_sync, phone, body)
         return True, _step_log(
-            node, "ok", f"SMS sent: {msg.sid}", extra={"message_sid": msg.sid}
+            node, "ok", f"SMS sent: {sid}", extra={"message_sid": sid}
         )
     except Exception as exc:
         logger.exception("Twilio SMS failed")

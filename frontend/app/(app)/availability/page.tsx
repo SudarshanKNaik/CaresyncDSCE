@@ -3,16 +3,19 @@
 import { useLocalAuth } from "@/lib/local-auth";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  cancelDoctorSlots,
   getDoctorAvailabilitySettings,
   listDoctorAppointments,
   listDoctorSlots,
+  reopenDoctorSlots,
   updateDoctorAvailabilitySettings,
   type DoctorAppointmentItem,
   type DoctorAvailabilitySettings,
   type DoctorManagedSlot,
 } from "@/services/api";
 import { Button } from "@/components/ui/button";
-import { CalendarClock, Loader2, RefreshCw } from "lucide-react";
+import { ScheduleRulesCard } from "@/components/app/schedule-rules-card";
+import { CalendarClock, CalendarX, ChevronLeft, ChevronRight, Loader2, RefreshCw, RotateCcw, X } from "lucide-react";
 
 function formatDateTime(value?: string | null) {
   if (!value) return "-";
@@ -33,12 +36,67 @@ function formatTimeLabel(value: string) {
   return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
+// Monday (YYYY-MM-DD) of the week a calendar date key falls in.
+function weekStartOf(dateKey: string) {
+  const d = new Date(`${dateKey}T00:00:00Z`);
+  const offset = (d.getUTCDay() + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - offset);
+  return d.toISOString().slice(0, 10);
+}
+
 function slotTone(status: string) {
   if (status === "available") return "border-success/40 bg-success/10 text-success";
   if (status === "reserved") return "border-warning/40 bg-warning/10 text-warning";
   if (status === "completed") return "border-emerald-400/50 bg-emerald-50 text-emerald-700";
   if (status === "booked") return "border-primary/40 bg-primary/10 text-primary";
   return "border-border bg-muted/40 text-muted-foreground";
+}
+
+function SlotAction({
+  slot,
+  displayStatus,
+  busy,
+  disabled,
+  nowMs,
+  onRemove,
+  onReopen,
+}: {
+  slot: DoctorManagedSlot;
+  displayStatus: string;
+  busy: boolean;
+  disabled: boolean;
+  nowMs: number;
+  onRemove: (slot: DoctorManagedSlot) => void;
+  onReopen: (slot: DoctorManagedSlot) => void;
+}) {
+  if (displayStatus === "completed") return null;
+  const isFuture = new Date(slot.slot_start).getTime() > nowMs;
+  if (!isFuture) return null;
+
+  const base =
+    "mt-1.5 inline-flex items-center gap-1 rounded px-1 py-0.5 text-[10px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50";
+
+  if (displayStatus === "cancelled") {
+    return (
+      <button type="button" disabled={disabled} onClick={() => onReopen(slot)} className={`${base} hover:bg-background/70`}>
+        {busy ? <Loader2 className="size-3 animate-spin" /> : <RotateCcw className="size-3" />}
+        Reopen
+      </button>
+    );
+  }
+
+  const hasPatient = displayStatus === "booked" || displayStatus === "reserved";
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={() => onRemove(slot)}
+      className={`${base} text-destructive hover:bg-destructive/10`}
+    >
+      {busy ? <Loader2 className="size-3 animate-spin" /> : <X className="size-3" />}
+      {hasPatient ? "Cancel appointment" : "Remove"}
+    </button>
+  );
 }
 
 export default function AvailabilityPage() {
@@ -51,6 +109,12 @@ export default function AvailabilityPage() {
   const [appointmentStatusBySlotId, setAppointmentStatusBySlotId] = useState<Record<string, string>>({});
   const [statusFilter, setStatusFilter] = useState("all");
   const [toggling, setToggling] = useState(false);
+  const [cancellingDay, setCancellingDay] = useState<string | null>(null);
+  const [weekIndex, setWeekIndex] = useState(0);
+  // Slot (or "day:<date>") with an action in flight, to disable its button.
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  // When slots were last loaded; decides which slots count as future.
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const [message, setMessage] = useState<string | null>(null);
 
@@ -71,6 +135,7 @@ export default function AvailabilityPage() {
       ]);
       setSettings(settingsData);
       setSlots(slotsData);
+      setNowMs(Date.now());
 
       const statusBySlot: Record<string, string> = {};
       for (const appt of (appointmentsData as DoctorAppointmentItem[])) {
@@ -123,11 +188,135 @@ export default function AvailabilityPage() {
       byDate.get(dateKey)?.set(timeKey, slot);
     }
 
-    const dates = Array.from(byDate.keys()).sort((a, b) => a.localeCompare(b));
+    const allDates = Array.from(byDate.keys()).sort((a, b) => a.localeCompare(b));
     const times = Array.from(allTimes).sort((a, b) => a.localeCompare(b));
 
-    return { dates, times, byDate };
-  }, [filteredSlots]);
+    // A month of slots is too wide for one table: page through it a week
+    // (Monday to Saturday) at a time.
+    const weekStarts = Array.from(new Set(allDates.map(weekStartOf))).sort();
+    const weekCount = Math.max(1, weekStarts.length);
+    const currentWeek = weekStarts[Math.min(weekIndex, weekCount - 1)];
+    const dates = allDates.filter((d) => weekStartOf(d) === currentWeek);
+
+    return { dates, times, byDate, weekCount, currentWeek };
+  }, [filteredSlots, weekIndex]);
+
+  // Slots a "Cancel day" would touch, from all slots (not just the filtered view),
+  // keyed the same way as the calendar columns. Completed visits are left alone.
+  const cancellableSlotsByDay = useMemo(() => {
+    const byDay = new Map<string, DoctorManagedSlot[]>();
+    for (const slot of slots) {
+      const start = new Date(slot.slot_start);
+      if (Number.isNaN(start.getTime())) continue;
+      const status = getDisplayStatus(slot);
+      if (status === "cancelled" || status === "completed") continue;
+      const dateKey = start.toISOString().slice(0, 10);
+      if (!byDay.has(dateKey)) byDay.set(dateKey, []);
+      byDay.get(dateKey)?.push(slot);
+    }
+    return byDay;
+  }, [slots, getDisplayStatus]);
+
+  const handleCancelDay = useCallback(async (day: string) => {
+    if (!doctorId) return;
+    const daySlots = cancellableSlotsByDay.get(day) || [];
+    if (daySlots.length === 0) return;
+
+    const bookedCount = daySlots.filter((slot) => slot.status === "booked" || slot.status === "reserved").length;
+    const reason = window.prompt(
+      `Cancel ${formatDayLabel(day)}?\n\n` +
+        `${daySlots.length} slot(s) will be closed so no one can book them.` +
+        (bookedCount > 0
+          ? `\n${bookedCount} booked appointment(s) will be cancelled and those patients notified.`
+          : "\nNo patients are booked on this day.") +
+        "\n\nOptional reason to show patients (press OK to continue, Cancel to stop):",
+      "",
+    );
+    if (reason === null) return;
+
+    setCancellingDay(day);
+    setMessage(null);
+    try {
+      const result = await cancelDoctorSlots(doctorId, {
+        slot_ids: daySlots.map((slot) => slot.id),
+        reason: reason.trim() || undefined,
+      });
+      setMessage(
+        `${formatDayLabel(day)} cancelled: ${result.cancelled_slots} slot(s) closed, ` +
+          `${result.cancelled_appointments} appointment(s) cancelled` +
+          (result.cancelled_appointments > 0 ? " and patients notified." : "."),
+      );
+      await fetchAvailabilityContext();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not cancel the day.");
+    } finally {
+      setCancellingDay(null);
+    }
+  }, [cancellableSlotsByDay, doctorId, fetchAvailabilityContext]);
+
+  // Future cancelled slots per day, for "Reopen day".
+  const reopenableSlotsByDay = useMemo(() => {
+    const byDay = new Map<string, DoctorManagedSlot[]>();
+    for (const slot of slots) {
+      const start = new Date(slot.slot_start);
+      if (Number.isNaN(start.getTime()) || slot.status !== "cancelled" || start.getTime() <= nowMs) continue;
+      const dateKey = start.toISOString().slice(0, 10);
+      if (!byDay.has(dateKey)) byDay.set(dateKey, []);
+      byDay.get(dateKey)?.push(slot);
+    }
+    return byDay;
+  }, [slots, nowMs]);
+
+  const handleRemoveSlot = useCallback(async (slot: DoctorManagedSlot) => {
+    if (!doctorId) return;
+    const when = formatDateTime(slot.slot_start);
+    const hasPatient = slot.status === "booked" || slot.status === "reserved";
+    let reason: string | null = "";
+    if (hasPatient) {
+      reason = window.prompt(
+        `Cancel the appointment at ${when}?\n\nThe patient will be notified and the slot closed.` +
+          "\n\nOptional reason to show the patient:",
+        "",
+      );
+      if (reason === null) return;
+    } else if (!window.confirm(`Remove the ${when} slot? Patients and the call agent won't be able to book it.`)) {
+      return;
+    }
+
+    setBusyKey(slot.id);
+    setMessage(null);
+    try {
+      const result = await cancelDoctorSlots(doctorId, {
+        slot_ids: [slot.id],
+        reason: reason?.trim() || undefined,
+      });
+      setMessage(
+        result.cancelled_appointments > 0
+          ? `Appointment at ${when} cancelled and the patient notified.`
+          : `Slot at ${when} removed.`,
+      );
+      await fetchAvailabilityContext();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not remove the slot.");
+    } finally {
+      setBusyKey(null);
+    }
+  }, [doctorId, fetchAvailabilityContext]);
+
+  const handleReopen = useCallback(async (slotIds: string[], label: string, key: string) => {
+    if (!doctorId || slotIds.length === 0) return;
+    setBusyKey(key);
+    setMessage(null);
+    try {
+      const result = await reopenDoctorSlots(doctorId, slotIds);
+      setMessage(`${label} reopened: ${result.reopened_slots} slot(s) bookable again.`);
+      await fetchAvailabilityContext();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not reopen.");
+    } finally {
+      setBusyKey(null);
+    }
+  }, [doctorId, fetchAvailabilityContext]);
 
   const handleToggleAvailability = useCallback(async (nextValue: boolean) => {
     if (!doctorId) return;
@@ -186,7 +375,7 @@ export default function AvailabilityPage() {
       <div>
         <h1 className="text-2xl font-semibold">Manage Availability</h1>
         <p className="text-sm text-muted-foreground">
-          Toggle your day planning and keep an auto-managed 3-day rolling slot window.
+          Set your working hours and slot length. Open slots are kept up to date automatically.
         </p>
       </div>
 
@@ -216,16 +405,47 @@ export default function AvailabilityPage() {
             Pending today: {settings?.pending_today_appointments || 0}
           </span>
         </div>
-        <p className="mt-3 text-xs text-muted-foreground">
-          Rule set: 10:30 AM to 4:30 PM, 30-minute slots, 1:30 PM to 2:30 PM break, Sundays closed, rolling 3-day window.
-        </p>
+        <ScheduleRulesCard doctorId={doctorId} onSaved={fetchAvailabilityContext} />
       </div>
+
+      {message && (
+        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          {message}
+        </div>
+      )}
 
       <div className="rounded-xl border border-border bg-card p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>
             <h2 className="text-sm font-semibold">Calendar Slots</h2>
-            <p className="text-xs text-muted-foreground">Table view by day and time.</p>
+            <p className="text-xs text-muted-foreground">
+              {calendarData.currentWeek
+                ? `Week of ${formatDayLabel(calendarData.currentWeek)} · week ${Math.min(weekIndex, calendarData.weekCount - 1) + 1} of ${calendarData.weekCount}`
+                : "Table view by day and time."}
+            </p>
+            <div className="mt-2 flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setWeekIndex((w) => Math.max(0, w - 1))}
+                disabled={weekIndex === 0}
+                className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs disabled:opacity-40"
+              >
+                <ChevronLeft className="size-3.5" />Previous week
+              </button>
+              <button
+                type="button"
+                onClick={() => setWeekIndex((w) => Math.min(calendarData.weekCount - 1, w + 1))}
+                disabled={weekIndex >= calendarData.weekCount - 1}
+                className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs disabled:opacity-40"
+              >
+                Next week<ChevronRight className="size-3.5" />
+              </button>
+              {weekIndex > 0 && (
+                <button type="button" onClick={() => setWeekIndex(0)} className="px-2 py-1 text-xs text-muted-foreground hover:text-foreground">
+                  This week
+                </button>
+              )}
+            </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select
@@ -261,11 +481,48 @@ export default function AvailabilityPage() {
               <thead>
                 <tr className="bg-muted/40">
                   <th className="sticky left-0 z-10 border-b border-r border-border bg-muted/60 px-3 py-2 text-left font-semibold">Time</th>
-                  {calendarData.dates.map((day) => (
-                    <th key={day} className="border-b border-border px-3 py-2 text-left font-semibold">
-                      {formatDayLabel(day)}
-                    </th>
-                  ))}
+                  {calendarData.dates.map((day) => {
+                    const cancellableCount = cancellableSlotsByDay.get(day)?.length || 0;
+                    const isCancelling = cancellingDay === day;
+                    return (
+                      <th key={day} className="border-b border-border px-3 py-2 text-left font-semibold">
+                        <div className="flex items-center justify-between gap-2">
+                          <span>{formatDayLabel(day)}</span>
+                          {cancellableCount > 0 ? (
+                            <button
+                              type="button"
+                              onClick={() => handleCancelDay(day)}
+                              disabled={cancellingDay !== null || loading}
+                              title={`Cancel all ${cancellableCount} open or booked slot(s) on this day`}
+                              className="inline-flex shrink-0 items-center gap-1 rounded-md border border-destructive/30 px-1.5 py-0.5 text-[10px] font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {isCancelling ? <Loader2 className="size-3 animate-spin" /> : <CalendarX className="size-3" />}
+                              {isCancelling ? "Cancelling" : "Cancel day"}
+                            </button>
+                          ) : (reopenableSlotsByDay.get(day)?.length || 0) > 0 ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleReopen(
+                                  (reopenableSlotsByDay.get(day) || []).map((s) => s.id),
+                                  formatDayLabel(day),
+                                  `day:${day}`,
+                                )
+                              }
+                              disabled={busyKey !== null || loading}
+                              title="Make this day's cancelled slots bookable again"
+                              className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {busyKey === `day:${day}` ? <Loader2 className="size-3 animate-spin" /> : <RotateCcw className="size-3" />}
+                              Reopen day
+                            </button>
+                          ) : (
+                            <span className="shrink-0 text-[10px] font-normal text-muted-foreground">Day closed</span>
+                          )}
+                        </div>
+                      </th>
+                    );
+                  })}
                 </tr>
               </thead>
               <tbody>
@@ -288,6 +545,15 @@ export default function AvailabilityPage() {
                               <p className="mt-1 text-[11px] leading-tight opacity-90">
                                 {formatDateTime(slot.slot_start)}
                               </p>
+                              <SlotAction
+                                slot={slot}
+                                displayStatus={displayStatus || slot.status}
+                                busy={busyKey === slot.id}
+                                disabled={busyKey !== null || cancellingDay !== null}
+                                nowMs={nowMs}
+                                onRemove={handleRemoveSlot}
+                                onReopen={(s) => handleReopen([s.id], formatDateTime(s.slot_start), s.id)}
+                              />
                             </div>
                           ) : (
                             <div className="rounded-md border border-dashed border-border px-2 py-4 text-center text-[11px] text-muted-foreground">
@@ -304,12 +570,6 @@ export default function AvailabilityPage() {
           </div>
         )}
       </div>
-
-      {message && (
-        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-          {message}
-        </div>
-      )}
     </div>
   );
 }

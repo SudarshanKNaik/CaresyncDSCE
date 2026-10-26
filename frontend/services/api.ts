@@ -93,6 +93,10 @@ export interface DoctorAppointmentItem {
   call_origin?: Record<string, unknown> | null;
   report_title?: string | null;
   report_date?: string | null;
+  cancelled_by?: "patient" | "doctor" | "system" | null;
+  cancelled_at?: string | null;
+  rescheduled_to_appointment_id?: string | null;
+  rescheduled_to_slot_start?: string | null;
 }
 
 export interface DoctorPortalPatientItem {
@@ -451,6 +455,48 @@ export async function deleteDoctorSlot(doctorId: string, slotId: string) {
     const detail = await response.text().catch(() => response.statusText);
     throw new Error(`Failed to delete slot (${response.status}): ${detail}`);
   }
+}
+
+export interface CancelDoctorSlotsResult {
+  cancelled_slots: number;
+  skipped_slots: number;
+  cancelled_appointments: number;
+  notified_patient_ids: string[];
+}
+
+export async function cancelDoctorSlots(
+  doctorId: string,
+  payload: { slot_ids: string[]; reason?: string },
+) {
+  const response = await fetch(
+    `${API_URL}/api/doctors/${doctorId}/slots/cancel`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`Failed to cancel slots (${response.status}): ${detail}`);
+  }
+  return response.json() as Promise<CancelDoctorSlotsResult>;
+}
+
+export async function reopenDoctorSlots(doctorId: string, slotIds: string[]) {
+  const response = await fetch(
+    `${API_URL}/api/doctors/${doctorId}/slots/reopen`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slot_ids: slotIds }),
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`Failed to reopen slots (${response.status}): ${detail}`);
+  }
+  return response.json() as Promise<{ reopened_slots: number; skipped_slots: number }>;
 }
 
 export async function reserveSlot(
@@ -1184,6 +1230,29 @@ export async function listDoctorUpcomingAppointments(
   return response.json() as Promise<DoctorAppointmentItem[]>;
 }
 
+export interface AppointmentActivityItem {
+  kind: "booked" | "cancelled" | "rescheduled";
+  appointment_id: string;
+  happened_at: string;
+  actor?: "patient" | "doctor" | "system" | null;
+  patient_name: string;
+  slot_start?: string | null;
+  new_slot_start?: string | null;
+}
+
+export async function listDoctorAppointmentActivity(doctorId: string, days = 14) {
+  const response = await fetch(
+    `${API_URL}/api/doctors/${doctorId}/appointment-activity?days=${days}`,
+  );
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(
+      `Failed to fetch appointment activity (${response.status}): ${detail}`,
+    );
+  }
+  return response.json() as Promise<AppointmentActivityItem[]>;
+}
+
 export async function listPatientUpcomingAppointments(
   authUserId: string,
 ): Promise<PatientPortalAppointment[]> {
@@ -1614,6 +1683,74 @@ export async function getBloodCampaignStatus(campaignId: string) {
   return response.json() as Promise<BloodCampaignDetail>;
 }
 
+// Blood requests (the doctor's form; stored as blood campaigns)
+
+export type BloodComponent = "whole_blood" | "packed_rbc" | "platelets" | "plasma";
+export type BloodUrgency = "emergency" | "urgent" | "planned";
+
+export interface BloodRequestInput {
+  doctor_id: string;
+  blood_type: string;
+  component: BloodComponent;
+  units_needed: number;
+  urgency: BloodUrgency;
+  required_by?: string | null;
+  recipient_name: string;
+  patient_id?: string | null;
+  reason?: string | null;
+  hospital_name: string;
+  ward?: string | null;
+  hospital_location: string;
+  contact_name: string;
+  contact_phone: string;
+}
+
+export interface BloodRequestItem {
+  id: string;
+  blood_type: string;
+  component: BloodComponent;
+  units_needed: number;
+  urgency: BloodUrgency;
+  required_by?: string | null;
+  recipient_name: string;
+  reason?: string | null;
+  hospital_name?: string | null;
+  ward?: string | null;
+  patient_location?: string | null;
+  contact_name?: string | null;
+  contact_phone?: string | null;
+  status: string;
+  created_at: string;
+  completed_at?: string | null;
+  donors_contacted: number;
+  donors_accepted: number;
+  calls_in_progress: number;
+}
+
+export async function createBloodRequest(payload: BloodRequestInput) {
+  const response = await fetch(`${API_URL}/api/blood-requests`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`Failed to create blood request (${response.status}): ${detail}`);
+  }
+  return response.json() as Promise<{ request_id: string; status: string }>;
+}
+
+export async function listBloodRequests(doctorId: string) {
+  const response = await fetch(
+    `${API_URL}/api/blood-requests?doctor_id=${encodeURIComponent(doctorId)}`,
+  );
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`Failed to fetch blood requests (${response.status}): ${detail}`);
+  }
+  return response.json() as Promise<BloodRequestItem[]>;
+}
+
 export async function getBloodCampaignMap(campaignId: string) {
   const response = await fetch(
     `${API_URL}/api/blood-campaigns/${campaignId}/map`,
@@ -1625,4 +1762,112 @@ export async function getBloodCampaignMap(campaignId: string) {
     );
   }
   return response.json() as Promise<BloodCampaignMapPayload>;
+}
+
+// ---------------------------------------------------------------------------
+// Google Calendar (per-doctor OAuth connection)
+// ---------------------------------------------------------------------------
+
+export interface GoogleCalendarStatus {
+  connected: boolean;
+  oauth_configured: boolean;
+  google_email?: string | null;
+  calendar_id?: string;
+  connected_at?: string | null;
+  last_error?: string | null;
+}
+
+export async function getGoogleCalendarStatus(doctorId: string) {
+  const response = await fetch(`${API_URL}/api/doctors/${doctorId}/google-calendar`);
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`Failed to load Google Calendar status (${response.status}): ${detail}`);
+  }
+  return response.json() as Promise<GoogleCalendarStatus>;
+}
+
+export async function startGoogleCalendarConnect(doctorId: string) {
+  const response = await fetch(`${API_URL}/api/doctors/${doctorId}/google-calendar/connect`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`Could not start Google sign-in (${response.status}): ${detail}`);
+  }
+  return response.json() as Promise<{ auth_url: string }>;
+}
+
+export async function disconnectGoogleCalendar(doctorId: string) {
+  const response = await fetch(`${API_URL}/api/doctors/${doctorId}/google-calendar`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`Failed to disconnect Google Calendar (${response.status}): ${detail}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Doctor schedule rules (hours, break, slot length, working days, window)
+// ---------------------------------------------------------------------------
+
+export interface DoctorSchedule {
+  day_start: string; // "HH:MM", clinic time
+  day_end: string;
+  break_start: string | null;
+  break_end: string | null;
+  slot_minutes: number;
+  working_days: number[]; // ISO: 1 = Monday ... 7 = Sunday
+  window_days: number;
+}
+
+export async function getDoctorSchedule(doctorId: string) {
+  const response = await fetch(`${API_URL}/api/doctors/${doctorId}/schedule`);
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`Failed to load schedule (${response.status}): ${detail}`);
+  }
+  return response.json() as Promise<DoctorSchedule & { is_default: boolean; timezone: string }>;
+}
+
+export async function saveDoctorSchedule(doctorId: string, schedule: DoctorSchedule) {
+  const response = await fetch(`${API_URL}/api/doctors/${doctorId}/schedule`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(schedule),
+  });
+  if (!response.ok) {
+    let detail = await response.text().catch(() => response.statusText);
+    try {
+      const parsed = JSON.parse(detail);
+      detail = typeof parsed.detail === "string" ? parsed.detail : parsed.detail?.[0]?.msg || detail;
+    } catch {
+      // keep raw text
+    }
+    throw new Error(detail);
+  }
+  return response.json() as Promise<{
+    schedule: DoctorSchedule;
+    slots_removed: number;
+    slots_added: number;
+    booked_outside_new_hours: number;
+  }>;
+}
+
+// ---------------------------------------------------------------------------
+// Video consultation (built-in 1:1 WebRTC call)
+// ---------------------------------------------------------------------------
+
+export async function getConsultationIceServers(): Promise<RTCIceServer[]> {
+  const response = await fetch(`${API_URL}/api/consultations/ice-servers`);
+  if (!response.ok) return [{ urls: ["stun:stun.l.google.com:19302"] }];
+  const data = (await response.json()) as { ice_servers: RTCIceServer[] };
+  return data.ice_servers;
+}
+
+/** WebSocket URL that relays call setup messages between doctor and patient. */
+export function consultationSignalUrl(appointmentId: string, actorRole: "doctor" | "patient", actorId: string) {
+  const base = API_URL.replace(/^http/, "ws");
+  const qs = new URLSearchParams({ actor_role: actorRole, actor_id: actorId });
+  return `${base}/api/consultations/${appointmentId}/signal?${qs.toString()}`;
 }

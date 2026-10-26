@@ -87,8 +87,14 @@ migration_files=(
   017_create_follow_up_cron_tables.sql
   018_remove_off_schedule_seed_slots.sql
   019_add_blood_request_fields.sql
-  020_create_ngo_portal_tables.sql
-  021_create_ngo_email_otps.sql
+  020_appointment_change_tracking.sql
+  021_google_calendar_oauth.sql
+  022_doctor_schedule_settings.sql
+  023_create_ngo_portal_tables.sql
+  024_create_ngo_email_otps.sql
+  025_add_ngo_darpan_id.sql
+  026_patient_preferred_language.sql
+  027_webrtc_consultation_rooms.sql
 )
 
 existing_markers="$(run_psql -tAc 'SELECT COUNT(*) FROM schema_migrations;' | tr -d '[:space:]')"

@@ -6,7 +6,10 @@ PostgreSQL service layer.
 This module replaces Supabase client calls with direct PostgreSQL access.
 """
 
+import logging
 import secrets
+import time as _time_module
+from dataclasses import dataclass
 from functools import lru_cache
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
@@ -20,6 +23,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _database_url() -> str:
@@ -111,14 +116,6 @@ def _table_has_column(table_name: str, column_name: str) -> bool:
         return cur.fetchone() is not None
 
 
-SLOT_START_TIME = time(10, 30)
-SLOT_END_TIME = time(16, 30)
-LUNCH_BREAK_START = time(13, 30)
-LUNCH_BREAK_END = time(14, 30)
-SLOT_DURATION_MINUTES = 30
-ROLLING_WINDOW_DAYS = 3
-
-
 def _clinic_timezone():
     try:
         return ZoneInfo(settings.clinic_timezone)
@@ -129,121 +126,336 @@ def _clinic_timezone():
 CLINIC_TZ = _clinic_timezone()
 
 
-def _is_sunday(day: date) -> bool:
-    return day.weekday() == 6
+# ---------------------------------------------------------------------------
+# Per-doctor schedule rules (editable on the Manage Availability page)
+# ---------------------------------------------------------------------------
 
 
-def _next_working_day(day: date) -> date:
-    candidate = day + timedelta(days=1)
-    while _is_sunday(candidate):
-        candidate += timedelta(days=1)
-    return candidate
+@dataclass(frozen=True)
+class DoctorSchedule:
+    day_start: time
+    day_end: time
+    break_start: time | None
+    break_end: time | None
+    slot_minutes: int
+    # Python weekdays: 0 = Monday ... 6 = Sunday.
+    working_days: frozenset[int]
+    window_days: int
 
+    def is_working_day(self, day: date) -> bool:
+        return day.weekday() in self.working_days
 
-def _iter_schedule_slots_for_day(day: date) -> list[tuple[datetime, datetime]]:
-    if _is_sunday(day):
-        return []
+    def in_break(self, local_time: time) -> bool:
+        return bool(
+            self.break_start and self.break_end and self.break_start <= local_time < self.break_end
+        )
 
-    slots: list[tuple[datetime, datetime]] = []
-    current = datetime.combine(day, SLOT_START_TIME, tzinfo=CLINIC_TZ)
-    day_end = datetime.combine(day, SLOT_END_TIME, tzinfo=CLINIC_TZ)
+    def is_inside_hours(self, dt: datetime) -> bool:
+        local = dt.astimezone(CLINIC_TZ)
+        if not self.is_working_day(local.date()):
+            return False
+        if local.time() < self.day_start or local.time() >= self.day_end:
+            return False
+        return not self.in_break(local.time())
 
-    while current < day_end:
-        slot_end = current + timedelta(minutes=SLOT_DURATION_MINUTES)
-        in_break = LUNCH_BREAK_START <= current.time() < LUNCH_BREAK_END
-        if not in_break and slot_end <= day_end:
+    def slots_for_day(self, day: date) -> list[tuple[datetime, datetime]]:
+        """(start, end) in UTC for every slot on a clinic-local day."""
+        if not self.is_working_day(day):
+            return []
+        slots: list[tuple[datetime, datetime]] = []
+        step = timedelta(minutes=self.slot_minutes)
+        current = datetime.combine(day, self.day_start, tzinfo=CLINIC_TZ)
+        day_end = datetime.combine(day, self.day_end, tzinfo=CLINIC_TZ)
+        break_start = datetime.combine(day, self.break_start, tzinfo=CLINIC_TZ) if self.break_start else None
+        break_end = datetime.combine(day, self.break_end, tzinfo=CLINIC_TZ) if self.break_end else None
+        while current + step <= day_end:
+            slot_end = current + step
+            overlaps_break = break_start and break_end and current < break_end and break_start < slot_end
+            if overlaps_break:
+                current = max(current + step, break_end)  # resume right after the break
+                continue
             slots.append((current.astimezone(timezone.utc), slot_end.astimezone(timezone.utc)))
-        current += timedelta(minutes=SLOT_DURATION_MINUTES)
+            current = slot_end
+        return slots
 
-    return slots
+    def next_working_day(self, day: date) -> date:
+        candidate = day + timedelta(days=1)
+        for _ in range(7):
+            if self.is_working_day(candidate):
+                return candidate
+            candidate += timedelta(days=1)
+        return candidate
+
+    def to_dict(self) -> dict[str, Any]:
+        fmt = lambda t: t.strftime("%H:%M") if t else None  # noqa: E731
+        return {
+            "day_start": fmt(self.day_start),
+            "day_end": fmt(self.day_end),
+            "break_start": fmt(self.break_start),
+            "break_end": fmt(self.break_end),
+            "slot_minutes": self.slot_minutes,
+            "working_days": sorted(d + 1 for d in self.working_days),  # ISO 1..7
+            "window_days": self.window_days,
+        }
 
 
-def _is_inside_working_hours(dt: datetime) -> bool:
-    local_time = dt.astimezone(CLINIC_TZ).time()
-    if local_time < SLOT_START_TIME or local_time >= SLOT_END_TIME:
-        return False
-    return not (LUNCH_BREAK_START <= local_time < LUNCH_BREAK_END)
+# Used until a doctor saves their own rules (the old fixed clinic schedule).
+DEFAULT_SCHEDULE = DoctorSchedule(
+    day_start=time(10, 30),
+    day_end=time(16, 30),
+    break_start=time(13, 30),
+    break_end=time(14, 30),
+    slot_minutes=30,
+    working_days=frozenset(range(6)),  # Monday to Saturday
+    window_days=30,
+)
+
+_SCHEDULE_CACHE_SECONDS = 30
+_schedule_cache: dict[str, tuple[float, DoctorSchedule]] = {}
+
+
+def get_doctor_schedule(doctor_id: str) -> DoctorSchedule:
+    key = str(doctor_id)
+    cached = _schedule_cache.get(key)
+    if cached and _time_module.monotonic() - cached[0] < _SCHEDULE_CACHE_SECONDS:
+        return cached[1]
+
+    schedule = DEFAULT_SCHEDULE
+    if _table_exists("doctor_schedule_settings"):
+        with _cursor() as cur:
+            cur.execute("SELECT * FROM doctor_schedule_settings WHERE doctor_id = %s", (key,))
+            row = cur.fetchone()
+        if row:
+            schedule = DoctorSchedule(
+                day_start=row["day_start"],
+                day_end=row["day_end"],
+                break_start=row["break_start"],
+                break_end=row["break_end"],
+                slot_minutes=int(row["slot_minutes"]),
+                working_days=frozenset(int(d) - 1 for d in row["working_days"]),
+                window_days=int(row["window_days"]),
+            )
+    _schedule_cache[key] = (_time_module.monotonic(), schedule)
+    return schedule
+
+
+def _table_exists(table_name: str) -> bool:
+    with _cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL AS ok", (f"public.{table_name}",))
+        return bool(cur.fetchone()["ok"])
 
 
 def _ensure_doctor_rolling_slots(doctor_id: str, from_day: date | None = None) -> None:
+    schedule = get_doctor_schedule(doctor_id)
     base_day = from_day or datetime.now(CLINIC_TZ).date()
     target_days = [
-        base_day + timedelta(days=offset) for offset in range(ROLLING_WINDOW_DAYS)
+        base_day + timedelta(days=offset) for offset in range(schedule.window_days)
     ]
-    target_days = [d for d in target_days if not _is_sunday(d)]
 
-    if not target_days:
+    # One statement for the whole window: with a month of slots (~260 per
+    # doctor) a query per slot made every slot lookup slow.
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for day in target_days:
+        for slot_start, slot_end in schedule.slots_for_day(day):
+            starts.append(slot_start)
+            ends.append(slot_end)
+    if not starts:
         return
 
     with _cursor() as cur:
         cur.execute(
             """
-            DELETE FROM availability_slots
-            WHERE doctor_id = %s
-              AND status != 'booked'
-              AND slot_start::date = ANY(%s::date[])
-              AND EXTRACT(DOW FROM slot_start) = 0
+            INSERT INTO availability_slots (
+                doctor_id,
+                slot_start,
+                slot_end,
+                status,
+                created_at,
+                updated_at
+            )
+            SELECT %s, s.slot_start, s.slot_end, 'available', now(), now()
+            FROM unnest(%s::timestamptz[], %s::timestamptz[]) AS s(slot_start, slot_end)
+            -- Never overlap an existing slot: after the doctor changes slot
+            -- length or hours, booked/removed slots from the old rules stay put.
+            WHERE NOT EXISTS (
+                SELECT 1 FROM availability_slots o
+                WHERE o.doctor_id = %s
+                  AND o.slot_start < s.slot_end
+                  AND o.slot_end > s.slot_start
+            )
+            ON CONFLICT (doctor_id, slot_start, slot_end) DO NOTHING
             """,
-            (doctor_id, target_days),
+            (doctor_id, starts, ends, doctor_id),
         )
 
-        for day in target_days:
-            for slot_start, slot_end in _iter_schedule_slots_for_day(day):
-                cur.execute(
-                    """
-                    INSERT INTO availability_slots (
-                        doctor_id,
-                        slot_start,
-                        slot_end,
-                        status,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (%s, %s, %s, 'available', now(), now())
-                    ON CONFLICT (doctor_id, slot_start, slot_end) DO NOTHING
-                    """,
-                    (doctor_id, slot_start, slot_end),
-                )
+
+def save_doctor_schedule(doctor_id: str, values: dict[str, Any]) -> dict[str, Any]:
+    """Save a doctor's schedule rules and rebuild their upcoming slots.
+
+    Unbooked future slots that don't fit the new rules are removed and new
+    ones are generated. Booked appointments are never touched; the result
+    reports how many now fall outside the new hours so the doctor can decide.
+    """
+    def _t(value: Any) -> time | None:
+        if value in (None, ""):
+            return None
+        return value if isinstance(value, time) else time.fromisoformat(str(value))
+
+    new = DoctorSchedule(
+        day_start=_t(values["day_start"]),
+        day_end=_t(values["day_end"]),
+        break_start=_t(values.get("break_start")),
+        break_end=_t(values.get("break_end")),
+        slot_minutes=int(values["slot_minutes"]),
+        working_days=frozenset(int(d) - 1 for d in values["working_days"]),
+        window_days=int(values["window_days"]),
+    )
+    if not (new.day_start and new.day_end) or new.day_start >= new.day_end:
+        raise RuntimeError("The day must end after it starts")
+    if (new.break_start is None) != (new.break_end is None):
+        raise RuntimeError("Set both break start and break end, or neither")
+    if new.break_start and not (new.day_start <= new.break_start < new.break_end <= new.day_end):
+        raise RuntimeError("The break must be inside working hours")
+    if not 10 <= new.slot_minutes <= 120:
+        raise RuntimeError("Slot length must be between 10 and 120 minutes")
+    if not new.working_days or not new.working_days <= set(range(7)):
+        raise RuntimeError("Choose at least one working day")
+    if not 1 <= new.window_days <= 90:
+        raise RuntimeError("Booking window must be between 1 and 90 days")
+    if not any(new.slots_for_day(d) for d in (date(2026, 1, 5) + timedelta(days=i) for i in range(7))):
+        raise RuntimeError("These hours leave no room for a single slot")
+
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO doctor_schedule_settings (
+                doctor_id, day_start, day_end, break_start, break_end,
+                slot_minutes, working_days, window_days, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s::smallint[], %s, now())
+            ON CONFLICT (doctor_id) DO UPDATE SET
+                day_start = EXCLUDED.day_start,
+                day_end = EXCLUDED.day_end,
+                break_start = EXCLUDED.break_start,
+                break_end = EXCLUDED.break_end,
+                slot_minutes = EXCLUDED.slot_minutes,
+                working_days = EXCLUDED.working_days,
+                window_days = EXCLUDED.window_days,
+                updated_at = now()
+            """,
+            (
+                doctor_id, new.day_start, new.day_end, new.break_start, new.break_end,
+                new.slot_minutes, sorted(d + 1 for d in new.working_days), new.window_days,
+            ),
+        )
+    _schedule_cache.pop(str(doctor_id), None)
+
+    # Which future slots the new rules produce.
+    today = datetime.now(CLINIC_TZ).date()
+    wanted = {
+        pair
+        for offset in range(new.window_days)
+        for pair in new.slots_for_day(today + timedelta(days=offset))
+    }
+
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT s.id, s.slot_start, s.slot_end, s.status,
+                   EXISTS (SELECT 1 FROM appointments a WHERE a.slot_id = s.id) AS has_appointment,
+                   EXISTS (
+                       SELECT 1 FROM appointments a
+                       WHERE a.slot_id = s.id AND a.status IN ('booked', 'confirmed')
+                   ) AS has_active_appointment
+            FROM availability_slots s
+            WHERE s.doctor_id = %s AND s.slot_start > now()
+            """,
+            (doctor_id,),
+        )
+        future = list(cur.fetchall())
+
+    to_remove = [
+        row["id"]
+        for row in future
+        if (row["slot_start"], row["slot_end"]) not in wanted
+        and not row["has_appointment"]
+        # Live holds (a patient on a call right now) are left alone; they expire.
+        and row["status"] in {"available", "cancelled"}
+    ]
+    booked_outside = [
+        row for row in future
+        if row["has_active_appointment"] and not new.is_inside_hours(row["slot_start"])
+    ]
+
+    removed = 0
+    if to_remove:
+        with _cursor() as cur:
+            cur.execute(
+                "DELETE FROM availability_slots WHERE id = ANY(%s::uuid[]) RETURNING id",
+                (to_remove,),
+            )
+            removed = len(cur.fetchall())
+
+    with _cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM availability_slots WHERE doctor_id = %s AND slot_start > now()",
+            (doctor_id,),
+        )
+        before = int(cur.fetchone()["n"])
+    _ensure_doctor_rolling_slots(doctor_id)
+    with _cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM availability_slots WHERE doctor_id = %s AND slot_start > now()",
+            (doctor_id,),
+        )
+        after = int(cur.fetchone()["n"])
+
+    return {
+        "schedule": new.to_dict(),
+        "slots_removed": removed,
+        "slots_added": after - before,
+        "booked_outside_new_hours": len(booked_outside),
+    }
 
 
 def _find_next_rebooking_slot(
     doctor_id: str, preferred_start: datetime, after_day: date
 ) -> dict[str, Any] | None:
-    with _cursor() as cur:
-        search_day = after_day
-        for _ in range(14):
-            if _is_sunday(search_day):
-                search_day += timedelta(days=1)
-                continue
+    schedule = get_doctor_schedule(doctor_id)
+    preferred_local_time = (
+        preferred_start.astimezone(CLINIC_TZ).time()
+        if schedule.is_inside_hours(preferred_start)
+        else schedule.day_start
+    )
+    search_day = after_day
+    for _ in range(14):
+        if not schedule.is_working_day(search_day):
+            search_day += timedelta(days=1)
+            continue
 
-            _ensure_doctor_rolling_slots(doctor_id, search_day)
+        _ensure_doctor_rolling_slots(doctor_id, search_day)
+        preferred_dt = datetime.combine(search_day, preferred_local_time, tzinfo=CLINIC_TZ)
+        day_start = datetime.combine(search_day, time(0, 0), tzinfo=CLINIC_TZ)
 
-            preferred_time = (
-                preferred_start.time()
-                if _is_inside_working_hours(preferred_start)
-                else SLOT_START_TIME
-            )
-            preferred_dt = datetime.combine(
-                search_day, preferred_time, tzinfo=timezone.utc
-            )
-
+        with _cursor() as cur:
             cur.execute(
                 """
                 SELECT id, doctor_id, slot_start, slot_end, status
                 FROM availability_slots
                 WHERE doctor_id = %s
-                  AND slot_start::date = %s
+                  AND slot_start >= %s AND slot_start < %s
                   AND status = 'available'
                 ORDER BY ABS(EXTRACT(EPOCH FROM (slot_start - %s))), slot_start
                 LIMIT 1
                 """,
-                (doctor_id, search_day, preferred_dt),
+                (doctor_id, day_start, day_start + timedelta(days=1), preferred_dt),
             )
             row = cur.fetchone()
-            if row:
-                return row
+        if row:
+            return row
 
-            search_day += timedelta(days=1)
+        search_day += timedelta(days=1)
 
     return None
 
@@ -735,7 +947,7 @@ def set_doctor_availability(
 
     moved_count = 0
     if not is_available and today_appointments:
-        next_working_day = _next_working_day(today_utc)
+        next_working_day = get_doctor_schedule(resolved_doctor_id).next_working_day(today_utc)
         for appointment in today_appointments:
             target_slot = _find_next_rebooking_slot(
                 resolved_doctor_id,
@@ -784,6 +996,10 @@ def set_doctor_availability(
                     ),
                 )
             moved_count += 1
+            _calendar_sync(appointment["appointment_id"])
+            _patient_notice(
+                appointment["appointment_id"], "moved", previous_start=appointment["slot_start"]
+            )
 
         with _cursor() as cur:
             cur.execute(
@@ -926,7 +1142,7 @@ def list_doctor_availability(doctor_id: str) -> list[dict[str, Any]]:
             (doctor_id, now_dt),
         )
         rows = list(cur.fetchall())
-    open_rows = [row for row in rows if _slot_is_open(row, now_dt)]
+    open_rows = _drop_google_busy(doctor_id, [row for row in rows if _slot_is_open(row, now_dt)])
     return [
         {
             **row,
@@ -959,6 +1175,8 @@ def _finalize_reserved_slot_booking(
     patient_id: str,
     consultation_type: str,
     notes: str | None,
+    *,
+    send_confirmation: bool = True,
 ) -> dict[str, Any] | None:
     with _cursor() as cur:
         cur.execute(
@@ -996,7 +1214,13 @@ def _finalize_reserved_slot_booking(
             """,
             (slot_id, patient_id, patient_id, slot_id, consultation_type, notes),
         )
-        return cur.fetchone()
+        appointment = cur.fetchone()
+    # Every new booking (portal, reschedule, AI call) passes through here.
+    if appointment:
+        _calendar_sync(appointment["id"])
+        if send_confirmation:
+            _booking_notice(appointment["id"])
+    return appointment
 
 
 def get_availability_slot(slot_id: str) -> dict[str, Any] | None:
@@ -1046,8 +1270,8 @@ def create_doctor_slot(
     start_dt = _parse_iso_datetime(slot_start)
     if not start_dt:
         raise RuntimeError("Invalid slot_start datetime")
-    if _is_sunday(start_dt.date()):
-        raise RuntimeError("Slots cannot be created on Sundays")
+    if not get_doctor_schedule(doctor_id).is_working_day(start_dt.astimezone(CLINIC_TZ).date()):
+        raise RuntimeError("That day is not one of the doctor's working days")
 
     return _insert_row(
         "availability_slots",
@@ -1467,6 +1691,22 @@ def list_doctor_appointments(doctor_id: str) -> list[dict[str, Any]]:
         else "NULL::text AS report_date"
     )
     report_join = "LEFT JOIN reports r ON r.id = a.report_id" if has_report_id else ""
+    if _table_has_column("appointments", "cancelled_by"):
+        change_cols = (
+            "a.cancelled_by, a.cancelled_at, a.rescheduled_to_appointment_id, "
+            "s2.slot_start AS rescheduled_to_slot_start"
+        )
+        change_join = (
+            "LEFT JOIN appointments a2 ON a2.id = a.rescheduled_to_appointment_id "
+            "LEFT JOIN availability_slots s2 ON s2.id = a2.slot_id"
+        )
+    else:
+        change_cols = (
+            "NULL::text AS cancelled_by, NULL::timestamptz AS cancelled_at, "
+            "NULL::uuid AS rescheduled_to_appointment_id, "
+            "NULL::timestamptz AS rescheduled_to_slot_start"
+        )
+        change_join = ""
 
     with _cursor() as cur:
         cur.execute(
@@ -1488,17 +1728,71 @@ def list_doctor_appointments(doctor_id: str) -> list[dict[str, Any]]:
                 s.slot_start,
                 s.slot_end,
                 {report_title_expr},
-                {report_date_expr}
+                {report_date_expr},
+                {change_cols}
             FROM appointments a
             LEFT JOIN patients p ON p.id = a.patient_id
             LEFT JOIN availability_slots s ON s.id = a.slot_id
             {report_join}
+            {change_join}
             WHERE a.doctor_id = %s
             ORDER BY a.created_at DESC
             """,
             (doctor_id,),
         )
         return list(cur.fetchall())
+
+
+def list_doctor_appointment_activity(doctor_id: str, days: int = 14, limit: int = 30) -> list[dict[str, Any]]:
+    """Recent appointment changes for the doctor's dashboard and bell, newest first.
+
+    One row per event: 'booked' (new appointment), 'cancelled' (with who did
+    it) or 'rescheduled' (patient moved it; includes the new time).
+    """
+    if not _table_has_column("appointments", "cancelled_by"):
+        return []
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT * FROM (
+                SELECT
+                    CASE WHEN a.rescheduled_to_appointment_id IS NOT NULL THEN 'rescheduled' ELSE 'cancelled' END AS kind,
+                    a.id AS appointment_id,
+                    a.cancelled_at AS happened_at,
+                    a.cancelled_by AS actor,
+                    p.name AS patient_name,
+                    s.slot_start,
+                    s2.slot_start AS new_slot_start
+                FROM appointments a
+                JOIN patients p ON p.id = a.patient_id
+                LEFT JOIN availability_slots s ON s.id = a.slot_id
+                LEFT JOIN appointments a2 ON a2.id = a.rescheduled_to_appointment_id
+                LEFT JOIN availability_slots s2 ON s2.id = a2.slot_id
+                WHERE a.doctor_id = %s
+                  AND a.status = 'cancelled'
+                  AND a.cancelled_at > now() - make_interval(days => %s)
+
+                UNION ALL
+
+                -- New bookings, except the new half of a reschedule (shown above).
+                SELECT
+                    'booked', a.id, a.created_at, NULL, p.name, s.slot_start, NULL
+                FROM appointments a
+                JOIN patients p ON p.id = a.patient_id
+                LEFT JOIN availability_slots s ON s.id = a.slot_id
+                WHERE a.doctor_id = %s
+                  AND a.created_at > now() - make_interval(days => %s)
+                  AND NOT EXISTS (
+                        SELECT 1 FROM appointments old
+                        WHERE old.rescheduled_to_appointment_id = a.id
+                  )
+            ) events
+            ORDER BY happened_at DESC
+            LIMIT %s
+            """,
+            (doctor_id, days, doctor_id, days, limit),
+        )
+        return _json_safe(list(cur.fetchall()))
 
 
 def get_appointment(appointment_id: str) -> dict[str, Any] | None:
@@ -1523,9 +1817,59 @@ def update_appointment(appointment_id: str, payload: dict[str, Any]) -> dict[str
     )
 
 
+def _drop_google_busy(doctor_id: str, slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hide open slots that clash with the doctor's Google Calendar (fails open)."""
+    try:
+        from app.services.google_calendar_service import drop_busy_slots
+
+        return drop_busy_slots(str(doctor_id), slots)
+    except Exception as exc:
+        logger.warning("Google busy-time filter skipped: %s", exc)
+        return slots
+
+
+def _booking_notice(appointment_id: Any, rescheduled_from: Any = None) -> None:
+    """SMS + email the patient their confirmed (or rescheduled) appointment, in the background."""
+    _patient_notice(
+        appointment_id,
+        "rescheduled" if rescheduled_from else "booked",
+        rescheduled_from=rescheduled_from,
+    )
+
+
+def _patient_notice(appointment_id: Any, event: str, **details: Any) -> None:
+    """Queue a patient SMS/email for an appointment change (best-effort)."""
+    try:
+        from app.services.notification_service import queue_appointment_notification
+
+        queue_appointment_notification(appointment_id, event, **details)
+    except Exception as exc:  # never let a notification break the change
+        logger.warning("Could not queue patient notification: %s", exc)
+
+
+def _calendar_sync(*appointment_ids: Any) -> None:
+    """Mirror these appointments to the doctor's Google Calendar (background, best-effort)."""
+    try:
+        from app.services.google_calendar_service import queue_appointment_sync
+
+        queue_appointment_sync(*appointment_ids)
+    except Exception as exc:  # never let calendar sync break a booking
+        logger.warning("Could not queue Google Calendar sync: %s", exc)
+
+
 def cancel_appointment(
-    appointment_id: str, cancel_note: str | None = None
+    appointment_id: str,
+    cancel_note: str | None = None,
+    *,
+    cancelled_by: str = "system",
+    rescheduled_to_appointment_id: str | None = None,
 ) -> dict[str, Any]:
+    """Cancel an appointment and free its slot.
+
+    ``cancelled_by`` ('patient' | 'doctor' | 'system') and the reschedule link
+    let the doctor's dashboard show who changed what. When the doctor cancels,
+    the patient gets a notification.
+    """
     appointment = get_appointment(appointment_id)
     if not appointment:
         raise RuntimeError("Appointment not found")
@@ -1537,13 +1881,39 @@ def cancel_appointment(
     if cancel_note:
         merged_note = f"{merged_note}\n{cancel_note}".strip()
 
-    updated = update_appointment(
-        appointment_id,
-        {
-            "status": "cancelled",
-            "notes": merged_note if merged_note else appointment.get("notes"),
-        },
-    )
+    changes: dict[str, Any] = {
+        "status": "cancelled",
+        "notes": merged_note if merged_note else appointment.get("notes"),
+    }
+    if _table_has_column("appointments", "cancelled_by"):
+        changes["cancelled_by"] = cancelled_by
+        changes["cancelled_at"] = _utc_now_iso()
+        if rescheduled_to_appointment_id:
+            changes["rescheduled_to_appointment_id"] = rescheduled_to_appointment_id
+    updated = update_appointment(appointment_id, changes)
+    _calendar_sync(appointment_id)
+    if not rescheduled_to_appointment_id:
+        _patient_notice(appointment_id, "cancelled", cancelled_by=cancelled_by)
+
+    if cancelled_by == "doctor":
+        slot = get_availability_slot(str(appointment["slot_id"])) or {}
+        start = _parse_iso_datetime(slot.get("slot_start"))
+        when = (
+            start.astimezone(CLINIC_TZ).strftime("%A %d %B %Y at %I:%M %p")
+            if start
+            else "your scheduled time"
+        )
+        create_notification(
+            {
+                "patient_id": appointment["patient_id"],
+                "recipient": "patient",
+                "message": (
+                    f"Your appointment on {when} was cancelled by the doctor. "
+                    "Please book a new slot from the patient portal."
+                ),
+                "priority": "high",
+            }
+        )
 
     _update_rows(
         "availability_slots",
@@ -1572,11 +1942,15 @@ def cancel_appointment_for_patient_portal(
     if not appointment or appointment["patient_id"] != patient["id"]:
         raise RuntimeError("Appointment not found for this patient")
 
+    # Cancelling frees the slot, so a finished visit must not reopen it.
+    if appointment["status"] in {"completed", "in_progress", "no_show"}:
+        raise RuntimeError(f"A {appointment['status']} appointment can't be cancelled")
+
     cancel_note = "Cancelled by patient via portal"
     if reason:
         cancel_note = f"{cancel_note}: {reason.strip()}"
 
-    return cancel_appointment(appointment_id, cancel_note=cancel_note)
+    return cancel_appointment(appointment_id, cancel_note=cancel_note, cancelled_by="patient")
 
 
 def cancel_doctor_slots(
@@ -1594,7 +1968,7 @@ def cancel_doctor_slots(
     if not slot_ids:
         raise RuntimeError("No slots selected")
 
-    cancel_note = "Cancelled by doctor (day cancelled)"
+    cancel_note = "Cancelled by doctor"
     if reason and reason.strip():
         cancel_note = f"{cancel_note}: {reason.strip()}"
 
@@ -1626,6 +2000,8 @@ def cancel_doctor_slots(
                     UPDATE appointments
                     SET status = 'cancelled',
                         notes = trim(both E'\n' from coalesce(notes, '') || E'\n' || %s),
+                        cancelled_by = 'doctor',
+                        cancelled_at = now(),
                         updated_at = now()
                     WHERE slot_id = ANY(%s::uuid[])
                       AND status IN ('booked', 'confirmed')
@@ -1669,6 +2045,10 @@ def cancel_doctor_slots(
                         (appt["patient_id"], message),
                     )
 
+    _calendar_sync(*(appt["id"] for appt in cancelled_appointments))
+    for appt in cancelled_appointments:
+        _patient_notice(appt["id"], "cancelled", cancelled_by="doctor", reason=reason)
+
     return _json_safe(
         {
             "cancelled_slots": len(target_ids),
@@ -1679,6 +2059,39 @@ def cancel_doctor_slots(
             ),
         }
     )
+
+
+def reopen_doctor_slots(doctor_id: str, slot_ids: list[str]) -> dict[str, Any]:
+    """Make cancelled future slots bookable again (undo Remove / Cancel day).
+
+    Previously cancelled appointments stay cancelled; patients rebook if they
+    still want the time.
+    """
+    if not slot_ids:
+        raise RuntimeError("No slots selected")
+
+    with _cursor() as cur:
+        cur.execute(
+            """
+            UPDATE availability_slots
+            SET status = 'available',
+                reserved_by = NULL,
+                reserved_until = NULL,
+                updated_at = now()
+            WHERE doctor_id = %s
+              AND id = ANY(%s::uuid[])
+              AND status = 'cancelled'
+              AND slot_start > now()
+            RETURNING id
+            """,
+            (doctor_id, slot_ids),
+        )
+        reopened = list(cur.fetchall())
+
+    return {
+        "reopened_slots": len(reopened),
+        "skipped_slots": len(slot_ids) - len(reopened),
+    }
 
 
 def reschedule_appointment_for_patient_portal(
@@ -1710,12 +2123,19 @@ def reschedule_appointment_for_patient_portal(
         patient_id=patient["id"],
         consultation_type=consultation_type or current["consultation_type"],
         notes=notes or current.get("notes"),
+        send_confirmation=False,  # a "rescheduled" email goes out below instead
     )
 
     if not new_appointment:
         raise RuntimeError("Could not book the selected slot")
 
-    cancel_appointment(current["id"], cancel_note=f"Rescheduled to slot {new_slot_id}")
+    cancel_appointment(
+        current["id"],
+        cancel_note=f"Rescheduled to slot {new_slot_id}",
+        cancelled_by="patient",
+        rescheduled_to_appointment_id=str(new_appointment["id"]),
+    )
+    _booking_notice(new_appointment["id"], rescheduled_from=current["id"])
     doctor = get_doctor(str(new_appointment["doctor_id"]))
 
     with _cursor() as cur:
@@ -2367,20 +2787,10 @@ def create_consultation_room(
 
     appointment = get_appointment(appointment_id)
     if appointment and appointment.get("consultation_type") == "video":
-        # Keep the call focused for doctor + patient and suppress feedback/close-page prompts.
-        jitsi_config_flags = "&".join(
-            [
-                "config.prejoinConfig.enabled=false",
-                "config.enableClosePage=false",
-                "config.feedbackPercentage=0",
-                "config.disableInviteFunctions=true",
-                "config.disableThirdPartyRequests=true",
-                "config.transcription.enabled=false",
-                "config.transcription.autoCaptionOnTranscribe=false",
-                "config.toolbarButtons=%5B%22microphone%22,%22camera%22,%22hangup%22,%22tileview%22,%22fullscreen%22,%22settings%22%5D",
-            ]
-        )
-        room_url = f"https://meet.jit.si/{safe_room_name}#{jitsi_config_flags}"
+        # Video runs in our own browser-to-browser call on the consultation
+        # page (no third-party sign-in), so the "URL" is that page.
+        provider = "webrtc"
+        room_url = f"/consultation/{appointment_id}"
 
     return _insert_row(
         "consultation_rooms",
@@ -2432,34 +2842,145 @@ def get_available_slot_options(doctor_id: str, count: int = 12) -> list[dict[str
     agent never offers a time the clinic doesn't actually work.
     """
     _ensure_doctor_rolling_slots(doctor_id)
-    now = datetime.now(timezone.utc)
+    return _bookable_slots(doctor_id, datetime.now(timezone.utc), None, count)
+
+
+def _bookable_slots(
+    doctor_id: str,
+    start_after: datetime,
+    start_before: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Open slots in clinic working hours, soonest first.
+
+    A reservation whose hold expired counts as open (same rule as
+    reserve_availability_slot), so a time a caller abandoned is offered again.
+    """
     with _cursor() as cur:
         cur.execute(
             """
             SELECT id, doctor_id, slot_start, slot_end, status
             FROM availability_slots
             WHERE doctor_id = %s
-              AND status = 'available'
+              AND (
+                    status = 'available'
+                 OR (status = 'reserved' AND reserved_until IS NOT NULL AND reserved_until < now())
+              )
               AND slot_start > %s
+              AND (%s::timestamptz IS NULL OR slot_start < %s::timestamptz)
             ORDER BY slot_start
             LIMIT %s
             """,
-            # Over-fetch so filtering out-of-hours rows still leaves `count` slots.
-            (doctor_id, now, count * 4),
+            # Over-fetch so filtering out-of-hours rows still leaves `limit` slots.
+            (doctor_id, start_after, start_before, start_before, limit * 4),
         )
         rows = list(cur.fetchall())
 
+    schedule = get_doctor_schedule(doctor_id)
     bookable = []
     for row in rows:
         start = _parse_iso_datetime(row.get("slot_start"))
-        if not start:
-            continue
-        if _is_sunday(start.astimezone(CLINIC_TZ).date()) or not _is_inside_working_hours(start):
+        if not start or not schedule.is_inside_hours(start):
             continue
         bookable.append(row)
-        if len(bookable) >= count:
-            break
-    return bookable
+    return _drop_google_busy(doctor_id, bookable)[:limit]
+
+
+def get_available_slots_on_date(doctor_id: str, day: date) -> list[dict[str, Any]]:
+    """Open slots on one clinic-local day (for the agent's live "times on date" tool)."""
+    _ensure_doctor_rolling_slots(doctor_id)
+    day_start = datetime.combine(day, time(0, 0), tzinfo=CLINIC_TZ)
+    start_after = max(day_start, datetime.now(CLINIC_TZ))
+    return _bookable_slots(doctor_id, start_after, day_start + timedelta(days=1), 50)
+
+
+def _speech_date(day: date) -> str:
+    return f"{day.strftime('%A')} {day.day} {day.strftime('%B')}"
+
+
+def format_available_dates_for_speech(slots: list[dict[str, Any]]) -> str:
+    """Just the days that have openings, e.g. "Tuesday 27 October or Wednesday 28 October".
+
+    Lets the agent offer dates first and only read out times for the day the
+    patient picks, instead of reciting every slot.
+    """
+    days = sorted(
+        {
+            start.astimezone(CLINIC_TZ).date()
+            for start in (_parse_iso_datetime(s.get("slot_start")) for s in slots)
+            if start
+        }
+    )
+    if not days:
+        return NO_SLOTS_AVAILABLE_TEXT
+    labels = [_speech_date(d) for d in days]
+    return labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " or " + labels[-1]
+
+
+def hold_slot_for_call(
+    doctor_id: str,
+    patient_id: str,
+    day: date,
+    local_time: time,
+    hold_minutes: int = 30,
+) -> dict[str, Any]:
+    """Reserve one slot for a patient while they're on the phone with the agent.
+
+    The hold is atomic (reserve_availability_slot), so two simultaneous calls
+    can't both get the same time: the second caller is told it was just taken.
+    Holding a new time releases this patient's other live holds with this
+    doctor, so changing their mind mid-call doesn't block several slots. The
+    post-call booking then converts the hold into an appointment.
+    """
+    local_start = datetime.combine(day, local_time, tzinfo=CLINIC_TZ)
+    start_utc = local_start.astimezone(timezone.utc)
+
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, slot_end FROM availability_slots
+            WHERE doctor_id = %s AND slot_start >= %s AND slot_start < %s
+            LIMIT 1
+            """,
+            (doctor_id, start_utc, start_utc + timedelta(minutes=1)),
+        )
+        slot = cur.fetchone()
+
+    on_schedule = bool(
+        slot
+        and start_utc > datetime.now(timezone.utc)
+        and get_doctor_schedule(doctor_id).is_inside_hours(start_utc)
+    )
+    if on_schedule and not _drop_google_busy(
+        doctor_id, [{"slot_start": start_utc, "slot_end": slot["slot_end"]}]
+    ):
+        on_schedule = False  # the doctor has something else in their calendar then
+    held = None
+    if on_schedule:
+        held = reserve_slot(slot_id=str(slot["id"]), patient_id=patient_id, hold_minutes=hold_minutes)
+
+    if held:
+        with _cursor() as cur:
+            cur.execute(
+                """
+                UPDATE availability_slots
+                SET status = 'available', reserved_by = NULL, reserved_until = NULL, updated_at = now()
+                WHERE doctor_id = %s
+                  AND reserved_by = %s
+                  AND status = 'reserved'
+                  AND id <> %s
+                """,
+                (doctor_id, patient_id, held["id"]),
+            )
+        return {"held": True, "slot": held}
+
+    return {
+        "held": False,
+        # "taken": a real slot someone else holds or booked (e.g. a parallel call);
+        # "not_on_schedule": the doctor doesn't offer that time at all.
+        "reason": "taken" if on_schedule else "not_on_schedule",
+        "alternatives": get_available_slots_on_date(doctor_id, day),
+    }
 
 
 def _speech_time(local_dt: datetime) -> str:
@@ -2925,6 +3446,17 @@ def list_campaign_eligible_donors(
             WHERE d.doctor_id = c.doctor_id
               AND UPPER(d.blood_type) = ANY(%s::text[])
               AND a.id IS NULL
+              -- Not while another request is calling them, and not if they've
+              -- already agreed to donate for another request recently.
+              AND NOT EXISTS (
+                    SELECT 1 FROM blood_campaign_donor_attempts o
+                    WHERE o.donor_id = d.id
+                      AND o.campaign_id <> c.id
+                      AND (
+                            o.status IN ('queued', 'active')
+                         OR (o.status = 'accepted' AND o.updated_at > now() - INTERVAL '90 days')
+                      )
+              )
               AND (
                     CASE
                         WHEN LOWER(d.gender) IN ('male', 'm') THEN d.last_donated_date + INTERVAL '90 days'

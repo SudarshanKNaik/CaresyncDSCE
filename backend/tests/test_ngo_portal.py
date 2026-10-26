@@ -114,9 +114,21 @@ def sent_otps(monkeypatch):
     return sent
 
 
+_used_darpan_ids: set[str] = set()
+
+
+def _darpan_id() -> str:
+    while True:
+        value = f"{random.randint(0, 99999):05d}"
+        if value not in _used_darpan_ids:
+            _used_darpan_ids.add(value)
+            return value
+
+
 def _register_body(email: str, otp: str, **overrides) -> dict:
     return {
         "ngo_name": f"Seva Trust {uuid.uuid4().hex[:6]}",
+        "darpan_id": _darpan_id(),
         "city": "Dharwad",
         "admin_name": "Priya Desai",
         "email": email,
@@ -184,6 +196,36 @@ def test_ngo_registration_validation_and_duplicate_name(client, sent_otps):
     )
     assert dup.status_code == 409
     assert dup.json()["detail"]["code"] == "ngo_exists"
+
+
+@pytest.mark.parametrize("darpan_id", ["", "1234", "123456", "12a45", "12 345"])
+def test_ngo_registration_requires_5_digit_darpan_id(client, sent_otps, darpan_id):
+    email = f"darpan-{uuid.uuid4().hex[:8]}@example.org"
+    client.post("/api/ngo/auth/otp/send", json={"email": email})
+    resp = client.post("/api/ngo/auth/register", json=_register_body(email, sent_otps[email], darpan_id=darpan_id))
+    assert resp.status_code == 422
+    assert "darpan_id" in resp.json()["detail"]["field_errors"]
+
+
+def test_ngo_darpan_id_is_unique_and_stored(client, sent_otps, db_conn):
+    darpan = _darpan_id()
+    first = f"d1-{uuid.uuid4().hex[:8]}@example.org"
+    client.post("/api/ngo/auth/otp/send", json={"email": first})
+    ok = client.post("/api/ngo/auth/register", json=_register_body(first, sent_otps[first], darpan_id=darpan))
+    assert ok.status_code == 201
+    stored = db_conn.execute(
+        "SELECT darpan_id FROM ngo_organizations WHERE id = %s", (ok.json()["user"]["ngo_id"],)
+    ).fetchone()[0]
+    assert stored == darpan
+
+    second = f"d2-{uuid.uuid4().hex[:8]}@example.org"
+    client.post("/api/ngo/auth/otp/send", json={"email": second})
+    dup = client.post("/api/ngo/auth/register", json=_register_body(second, sent_otps[second], darpan_id=darpan))
+    assert dup.status_code == 409
+    assert dup.json()["detail"]["code"] == "darpan_id_exists"
+    # The duplicate was rejected before the OTP was spent, so the code still works.
+    retry = client.post("/api/ngo/auth/register", json=_register_body(second, sent_otps[second]))
+    assert retry.status_code == 201
 
 
 def test_ngo_otp_attempts_are_limited(client, sent_otps):

@@ -87,7 +87,7 @@ class NgoOtpRequest(BaseModel):
 class NgoRegisterRequest(BaseModel):
     ngo_name: str = Field(min_length=1, max_length=200)
     city: str | None = Field(default=None, max_length=100)
-    registration_number: str | None = Field(default=None, max_length=100)
+    darpan_id: str = Field(default="", max_length=10)  # 5 digits; validated in the service
     contact_phone: str | None = Field(default=None, max_length=20)
     admin_name: str = Field(min_length=1, max_length=200)
     email: str = Field(min_length=3, max_length=254)
