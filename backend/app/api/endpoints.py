@@ -44,6 +44,8 @@ router = APIRouter()
 ALLOWED_TRIGGER_UPLOAD_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
 FOLLOW_UP_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "skipped"}
+# ElevenLabs conversation statuses that mean the call is over and analysed.
+ELEVENLABS_FINISHED_STATUSES = {"done", "success", "completed", "interrupted"}
 _follow_up_scheduler_task: asyncio.Task | None = None
 _follow_up_scheduler_started_at: datetime | None = None
 _follow_up_scheduler_last_tick_at: datetime | None = None
@@ -2714,7 +2716,7 @@ async def _auto_poll_call_result(
             )
             logger.info("Auto-poll: full analysis = %s", str(analysis)[:2000])
 
-            if conv_status not in ("done", "success", "completed", "interrupted"):
+            if conv_status not in ELEVENLABS_FINISHED_STATUSES:
                 logger.info(
                     "Auto-poll attempt %d: conversation is still %s. Waiting %ds...",
                     attempt,
@@ -3303,7 +3305,7 @@ async def agent_tool_available_times(body: AgentAvailableTimesRequest, request: 
             "message": f"On {spoken_date} the open times are: {', '.join(times)}.",
         }
 
-    upcoming = await _run_db_call(db.get_available_slot_options, doctor_id, 60)
+    upcoming = await _run_db_call(db.get_available_slot_options, doctor_id, db.CALL_SLOT_LIMIT)
     return {
         "available": False,
         "date": day.isoformat(),
@@ -4219,8 +4221,10 @@ async def check_call_status(log_id: str):
         conv_status,
     )
 
-    # If conversation is still in progress, return early
-    if conv_status in ("in_progress", "processing", "initiated", "queued"):
+    # Only a finished conversation has results. ElevenLabs reports a live call
+    # as "in-progress" (hyphen), so listing live statuses let it slip through
+    # and closed the call before the patient had picked a slot.
+    if conv_status not in ELEVENLABS_FINISHED_STATUSES:
         return {
             "status": "in_progress",
             "message": "Call is still in progress.",

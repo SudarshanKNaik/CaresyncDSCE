@@ -475,12 +475,14 @@ async def _handle_call_patient(node: dict, context: dict) -> tuple[bool, dict]:
 
     if doctor_id and not available_slots_str:
         try:
-            # Give the agent the full upcoming list (not just 3) so it can answer
-            # "what else do you have?" without making times up.
-            # Dates come from the whole open window; the full time list (a
-            # fallback for agents without the live tools) is capped at 12.
-            window_slots = db_svc.get_available_slot_options(doctor_id, count=60)
-            slot_options_raw = window_slots[:12]
+            # Every open slot in the booking window, so the agent can read out
+            # all the times on whichever day the patient picks. A short list
+            # cut days off partway (e.g. only 10:30 and 11:00 on the 28th) and
+            # is all the agent has when the live slot tools aren't reachable.
+            window_slots = db_svc.get_available_slot_options(
+                doctor_id, count=db_svc.CALL_SLOT_LIMIT
+            )
+            slot_options_raw = window_slots
             available_slots_str = db_svc.format_slot_options_for_speech(
                 slot_options_raw
             )
@@ -568,7 +570,8 @@ async def _handle_call_patient(node: dict, context: dict) -> tuple[bool, dict]:
                 "report_title": report_title,
                 "report_date": report_date,
                 "doctor_specialty": doctor_specialty,
-                "slot_options": slot_options_raw,
+                # A preview only; the full list is on the call log.
+                "slot_options": slot_options_raw[:12],
             },
         )
     except Exception as exc:

@@ -2835,6 +2835,10 @@ NO_SLOTS_AVAILABLE_TEXT = (
 )
 
 
+# Enough to cover the whole 30-day booking window at 30-minute slots.
+CALL_SLOT_LIMIT = 500
+
+
 def get_available_slot_options(doctor_id: str, count: int = 12) -> list[dict[str, Any]]:
     """Return the next `count` bookable slots for a doctor (used for offering during call).
 
